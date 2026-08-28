@@ -34,4 +34,4 @@ npm run build
 npm run build:pages
 ```
 
-После каждого push в `main` GitHub Actions автоматически обновляет GitHub Pages.
+Публичная версия хранится в ветке `gh-pages`. Она собрана командой `npm run build:pages` и не требует серверной части.
