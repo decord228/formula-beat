@@ -6,7 +6,7 @@ type SignalMode = "bytebeat" | "signed" | "floatbeat" | "funcbeat";
 type Track = { name: string; author: string; bpm: number; color: string; formula: string; blurb: string; mode: SignalMode; hz: number; n: number; volume: number };
 type Note = { id: number; lane: number; born: number; hitAt: number; kind: "tap" | "hold"; duration: number; pressed?: boolean; hit?: boolean; missed?: boolean };
 type Particle = { x: number; y: number; vx: number; vy: number; life: number; size: number };
-type RhythmEvent = { hitAt: number; lane: number; strength: number; hold: boolean; duration: number };
+type RhythmEvent = { hitAt: number; lane: number; strength: number; hold: boolean; duration: number; source: "transient" | "melody" };
 type Modifiers = { auto: boolean; noFail: boolean; hidden: boolean };
 type FormulaSample = number | number[];
 
@@ -36,11 +36,33 @@ const TRACKS: Track[] = [
 const LANES = ["D", "F", "J", "K"];
 const TIMING_WINDOWS = [
   { perfect: .07, great: .135, hit: .22, missDamage: 4 },
-  { perfect: .05, great: .1, hit: .17, missDamage: 7 },
+  { perfect: .06, great: .12, hit: .19, missDamage: 5 },
   { perfect: .04, great: .08, hit: .14, missDamage: 9 },
 ];
 const JUDGE_POSITION = 88;
 const clamp = (n: number, a: number, b: number) => Math.max(a, Math.min(b, n));
+
+function detectPitch(samples: Float32Array, sampleRate: number) {
+  const stride = 4;
+  let rms = 0;
+  for (let i = 0; i < samples.length; i += stride) rms += samples[i] * samples[i];
+  rms = Math.sqrt(rms / Math.ceil(samples.length / stride));
+  if (rms < .035) return { midi: 0, confidence: 0 };
+  const minLag = Math.max(2, Math.floor(sampleRate / 1000 / stride));
+  const maxLag = Math.min(Math.floor(samples.length / stride) - 2, Math.floor(sampleRate / 70 / stride));
+  let bestLag = 0; let best = 0;
+  for (let lag = minLag; lag <= maxLag; lag++) {
+    let correlation = 0; let leftPower = 0; let rightPower = 0;
+    for (let i = 0; i + lag * stride < samples.length; i += stride) {
+      const a = samples[i]; const b = samples[i + lag * stride];
+      correlation += a * b; leftPower += a * a; rightPower += b * b;
+    }
+    const normalized = correlation / Math.sqrt(leftPower * rightPower + 1e-9);
+    if (normalized > best) { best = normalized; bestLag = lag; }
+  }
+  const frequency = bestLag ? sampleRate / (bestLag * stride) : 0;
+  return { midi: frequency ? 69 + 12 * Math.log2(frequency / 440) : 0, confidence: best };
+}
 
 function compileFormula(source: string, mode?: SignalMode) {
   const cleaned = source.replaceAll("\\*", "*").replaceAll("\\_", "_");
@@ -104,7 +126,7 @@ export default function Home() {
   const idRef = useRef(1);
   const nextBeatRef = useRef(0);
   const rafRef = useRef(0);
-  const spectrumRef = useRef({ energy: 0, peak: 0, wave: new Float32Array(128) });
+  const spectrumRef = useRef({ energy: 0, peak: 0, flux: 0, intensity: 0, silence: true, pitch: 0, pitchConfidence: 0, wave: new Float32Array(128) });
   const particlesRef = useRef<Particle[]>([]);
   const rhythmEventsRef = useRef<RhythmEvent[]>([]);
   const gameActiveRef = useRef(false);
@@ -147,7 +169,9 @@ export default function Home() {
     playbackSpeedRef.current=1;
     let tick = 0; let lastFormulaTick = -1; let cachedResult: FormulaSample = 0; let runtimeFailed = false;
     let renderStride=mode==="funcbeat"?2:1;let callbackLoad=0;
-    let previousMono = 0; let previousEnergy = 0; let adaptiveFlux = .025; let lastOnsetAt = -10; let eventIndex = 0;
+    let previousMono = 0; let previousEnergy = 0; let adaptiveFlux = .025; let adaptiveEnergy = 0; let lastOnsetAt = -10; let lastMelodyAt = -10; let eventIndex = 0;
+    let smoothedPitch = 60; let lastStablePitch = 60;
+    const analysisMono = new Float32Array(1024);
     processor.onaudioprocess = (event) => {
       const callbackStarted=performance.now();
       const left = event.outputBuffer.getChannelData(0);
@@ -162,7 +186,7 @@ export default function Home() {
           const l = normalizeSample(Number(rawLeft ?? 0), mode);
           const r = normalizeSample(Number(rawRight ?? l), mode);
           left[i] = l; right[i] = r;
-          const mono = (l + r) / 2; flux += Math.abs(mono - previousMono); previousMono = mono;
+          const mono = (l + r) / 2; analysisMono[i] = mono; flux += Math.abs(mono - previousMono); previousMono = mono;
           const amp = (Math.abs(l) + Math.abs(r)) / 2;
           energy += amp; peak = Math.max(peak, amp);
           if (i % 8 === 0) spectrumRef.current.wave[(i / 8) % 128] = (l + r) / 2;
@@ -171,24 +195,49 @@ export default function Home() {
         left.fill(0); right.fill(0);
         if (!runtimeFailed) { runtimeFailed = true; const message = error instanceof Error ? error.message : "unknown error"; setStatus(`RUNTIME ERROR: ${message.toUpperCase().slice(0,48)}`); }
       }
-      const callbackBudget=left.length/ctx.sampleRate*1000;callbackLoad=callbackLoad*.88+(performance.now()-callbackStarted)/callbackBudget*.12;
-      if(hz>=ctx.sampleRate*.75){if(callbackLoad>.82)renderStride=mode==="funcbeat"?8:4;else if(callbackLoad>.58)renderStride=mode==="funcbeat"?4:2;else if(callbackLoad<.32)renderStride=mode==="funcbeat"?2:1}
-      spectrumRef.current.energy = energy / left.length;
-      spectrumRef.current.peak = peak;
       const blockEnergy = energy / left.length; const blockFlux = flux / left.length;
       adaptiveFlux = adaptiveFlux * .965 + blockFlux * .035;
+      adaptiveEnergy = adaptiveEnergy ? adaptiveEnergy * .998 + blockEnergy * .002 : Math.max(.025, blockEnergy);
       const onsetScore = Math.max(0, blockEnergy - previousEnergy * .9) + Math.max(0, blockFlux - adaptiveFlux) * .85;
-      const onsetCooldown = difficulty === 1 ? 60 / track.bpm * .72 : difficulty === 2 ? .17 : .115;
+      const relativeEnergy = blockEnergy / Math.max(.025, adaptiveEnergy);
+      const rawIntensity = clamp((relativeEnergy - .55) * .62 + onsetScore * 3.2 + peak * .14, 0, 1);
+      const pitch = kind === "game" ? detectPitch(analysisMono, ctx.sampleRate) : { midi: 0, confidence: 0 };
+      spectrumRef.current.energy = blockEnergy;
+      spectrumRef.current.peak = peak;
+      spectrumRef.current.flux = blockFlux;
+      spectrumRef.current.intensity = spectrumRef.current.intensity * .86 + rawIntensity * .14;
+      spectrumRef.current.silence = blockEnergy < .025 && peak < .075;
+      spectrumRef.current.pitch = pitch.midi;
+      spectrumRef.current.pitchConfidence = pitch.confidence;
+      const beat = 60 / track.bpm;
+      const onsetCooldown = difficulty === 1 ? beat * .7 : difficulty === 2 ? beat * .42 : beat * .22;
       if (kind === "game" && gameActiveRef.current && ctx.currentTime - lastOnsetAt > onsetCooldown && onsetScore > .028 + adaptiveFlux * .52) {
         const relativeNow = (performance.now() - startRef.current) / 1000;
         const strength = clamp(onsetScore * 5 + peak * .35, 0, 1);
-        const lane = Math.abs((lastFormulaTick ^ Math.floor(blockFlux * 10000) ^ eventIndex * 17)) % 4;
+        const patterns = difficulty === 1 ? [0,1,2,3,2,1] : difficulty === 2 ? [0,1,3,2,1,2,0,3] : [0,3,1,2,2,1,3,0];
+        const lane = patterns[eventIndex % patterns.length];
         const stableTone = blockEnergy > .27 && blockFlux < Math.max(.22, adaptiveFlux * 1.45);
-        const hold = difficulty > 1 && stableTone && eventIndex > 0 && eventIndex % (difficulty === 3 ? 7 : 11) === 0;
-        rhythmEventsRef.current.push({ hitAt: relativeNow + 1.6, lane, strength, hold, duration: hold ? 60 / track.bpm * (difficulty === 3 ? 2.5 : 2) : 0 });
+        const holdEvery = difficulty === 1 ? 12 : difficulty === 2 ? 10 : 7;
+        const hold = stableTone && eventIndex > 0 && eventIndex % holdEvery === 0;
+        rhythmEventsRef.current.push({ hitAt: relativeNow + 1.6, lane, strength, hold, duration: hold ? beat * (difficulty === 3 ? 2.25 : difficulty === 2 ? 1.5 : 1.25) : 0, source: "transient" });
         if (rhythmEventsRef.current.length > 32) rhythmEventsRef.current.shift();
         lastOnsetAt = ctx.currentTime; eventIndex++;
       }
+      const pitchGate = mode === "bytebeat" || mode === "signed" ? .72 : mode === "funcbeat" ? .64 : .58;
+      if (kind === "game" && gameActiveRef.current && pitch.confidence > pitchGate && blockEnergy > .055) {
+        smoothedPitch = smoothedPitch * .92 + pitch.midi * .08;
+        const pitchChange = Math.abs(pitch.midi - lastStablePitch);
+        const melodyCooldown = difficulty === 1 ? beat * .9 : difficulty === 2 ? beat * .48 : beat * .24;
+        if (pitchChange > .85 && ctx.currentTime - lastMelodyAt > melodyCooldown && ctx.currentTime - lastOnsetAt > .055) {
+          const relativeNow = (performance.now() - startRef.current) / 1000;
+          const lane = clamp(Math.round(1.5 + (pitch.midi - smoothedPitch) / 2.5), 0, 3);
+          rhythmEventsRef.current.push({ hitAt: relativeNow + 1.6, lane, strength: clamp(pitch.confidence * .7 + pitchChange * .08, 0, 1), hold: false, duration: 0, source: "melody" });
+          if (rhythmEventsRef.current.length > 32) rhythmEventsRef.current.shift();
+          lastStablePitch = pitch.midi; lastMelodyAt = ctx.currentTime;
+        }
+      }
+      const callbackBudget=left.length/ctx.sampleRate*1000;callbackLoad=callbackLoad*.88+(performance.now()-callbackStarted)/callbackBudget*.12;
+      if(hz>=ctx.sampleRate*.75){if(callbackLoad>.82)renderStride=mode==="funcbeat"?8:4;else if(callbackLoad>.58)renderStride=mode==="funcbeat"?4:2;else if(callbackLoad<.32)renderStride=mode==="funcbeat"?2:1}
       previousEnergy = blockEnergy;
     };
     processor.connect(delay); delay.connect(filter); filter.connect(gain); gain.connect(ctx.destination);
@@ -222,6 +271,20 @@ export default function Home() {
     for (let i=0;i<amount;i++) particlesRef.current.push({x,y:h*(JUDGE_POSITION/100),vx:(Math.random()-.5)*7,vy:-2-Math.random()*7,life:1,size:2+Math.random()*6});
   }, []);
 
+  const playHitSound = useCallback((lane: number, release = false) => {
+    const ctx = audioRef.current?.ctx;
+    if (!ctx || ctx.state === "closed") return;
+    const oscillator = ctx.createOscillator(); const hitGain = ctx.createGain();
+    const frequencies = [440, 523.25, 659.25, 783.99];
+    oscillator.type = release ? "sine" : "triangle";
+    oscillator.frequency.setValueAtTime(frequencies[lane] * (release ? .75 : 1), ctx.currentTime);
+    oscillator.frequency.exponentialRampToValueAtTime(frequencies[lane] * (release ? .7 : .92), ctx.currentTime + .07);
+    hitGain.gain.setValueAtTime(.0001, ctx.currentTime);
+    hitGain.gain.exponentialRampToValueAtTime(release ? .018 : .032, ctx.currentTime + .006);
+    hitGain.gain.exponentialRampToValueAtTime(.0001, ctx.currentTime + (release ? .09 : .075));
+    oscillator.connect(hitGain); hitGain.connect(ctx.destination); oscillator.start(); oscillator.stop(ctx.currentTime + .1);
+  }, []);
+
   const pressLane = useCallback((lane: number) => {
     if (game !== "running" || modifiers.auto) return;
     setPressedLanes(v => v.map((pressed,i)=>i===lane?true:pressed));
@@ -242,9 +305,10 @@ export default function Home() {
     if (best.kind === "hold") { best.pressed = true; setLastJudgement("HOLD"); }
     else { best.hit = true; setLastJudgement(label); }
     setTimingMs(Math.round(offset*1000)); setCombo(v => v + 1); setScore(v => v + pts); setHealth(v => clamp(v + 1.2, 0, 100));
+    playHitSound(lane);
     burst(lane, best.kind === "hold" ? 10 : 18);
     setNotes([...notesRef.current]);
-  }, [burst, difficulty, game, modifiers.auto]);
+  }, [burst, difficulty, game, modifiers.auto, playHitSound]);
 
   const releaseLane = useCallback((lane: number) => {
     setPressedLanes(v => v.map((pressed,i)=>i===lane?false:pressed));
@@ -255,11 +319,12 @@ export default function Home() {
     hold.pressed = false;
     if (now >= hold.hitAt + hold.duration - .16) {
       hold.hit = true; setTimingMs(Math.round((now-(hold.hitAt+hold.duration))*1000)); setScore(v=>v+Math.round(1200+hold.duration*900)); setCombo(v=>v+1); setLastJudgement("RELEASE"); setHealth(v=>clamp(v+3,0,100)); burst(lane,28);
+      playHitSound(lane, true);
     } else {
       hold.missed = true; setTimingMs(Math.round((now-(hold.hitAt+hold.duration))*1000)); setCombo(0); setLastJudgement("EARLY"); damageSync(10);
     }
     setNotes([...notesRef.current]);
-  }, [burst, damageSync, game, modifiers.auto]);
+  }, [burst, damageSync, game, modifiers.auto, playHitSound]);
 
   useEffect(() => {
     const down = (e: KeyboardEvent) => { const i = LANES.indexOf(e.key.toUpperCase()); if (i >= 0 && !e.repeat) pressLane(i); if (e.key === "Escape" && game === "running") { stopAudio(); setGame("setup"); } };
@@ -273,10 +338,14 @@ export default function Home() {
     let lastUiAt = -1;
     const loop = () => {
       const now = (performance.now() - startRef.current) / 1000;
+      const gridStep = difficulty === 1 ? beat : difficulty === 2 ? beat / 2 : beat / 4;
       const addNote = (hitAt: number, desiredLane: number, hold: boolean, duration: number) => {
+        const cluster = notesRef.current.find(note=>Math.abs(note.hitAt-hitAt)<gridStep*.24);
+        if(cluster) hitAt=cluster.hitAt;
         if (notesRef.current.some(note=>Math.abs(note.hitAt-hitAt)<.085 && note.lane===desiredLane)) return;
         let lane = desiredLane; let found = false;
-        for(let offset=0;offset<4;offset++){const candidate=(desiredLane+offset)%4;if(laneBusyUntilRef.current[candidate] < hitAt-.08){lane=candidate;found=true;break}}
+        const laneOffsets=[0,2,1,3];
+        for(const offset of laneOffsets){const candidate=(desiredLane+offset)%4;if(laneBusyUntilRef.current[candidate] < hitAt-.08){lane=candidate;found=true;break}}
         if(!found) return;
         notesRef.current.push({id:idRef.current++,lane,born:now,hitAt,kind:hold?"hold":"tap",duration:hold?duration:0});
         laneBusyUntilRef.current[lane]=hitAt+(hold?duration:.1)+.08;
@@ -284,27 +353,40 @@ export default function Home() {
 
       const detected = rhythmEventsRef.current.splice(0);
       for(const event of detected){
-        let hitAt=event.hitAt;
-        if(difficulty===1) hitAt=1.6+Math.round((hitAt-1.6)/beat)*beat;
-        const minimumSpacing=difficulty===1?beat*.9:difficulty===2?beat*.34:.115;
-        if(hitAt<now+.28 || hitAt-lastDetectedHitRef.current<minimumSpacing) continue;
-        addNote(hitAt,event.lane,difficulty===1?false:event.hold,event.duration);
+        const hitAt=1.6+Math.round((event.hitAt-1.6)/gridStep)*gridStep;
+        const minimumSpacing=difficulty===1?beat*.68:difficulty===2?beat*.46:beat*.2;
+        const sameCluster=Math.abs(hitAt-lastDetectedHitRef.current)<gridStep*.12;
+        if(hitAt<now+.28 || (!sameCluster && hitAt-lastDetectedHitRef.current<minimumSpacing)) continue;
+        if(sameCluster && (difficulty===1 || event.strength<.62)) continue;
+        const allowHold=event.hold && (difficulty>1 || Math.round((hitAt-1.6)/beat)%12===0);
+        addNote(hitAt,event.lane,allowHold,event.duration || beat*1.25);
         lastDetectedHitRef.current=Math.max(lastDetectedHitRef.current,hitAt);
       }
 
-      const density = difficulty === 1 ? 1 : .5;
       while (now + 1.6 > nextBeatRef.current) {
-        const pulse = spectrumRef.current.energy + spectrumRef.current.peak * .32;
+        const signal=spectrumRef.current;
+        const pulse = signal.energy + signal.peak * .32;
         const threshold = (100 - sensitivity) / 175;
-        const subdivision = beat * density;
-        const step = Math.round(nextBeatRef.current / subdivision);
+        const subdivision = gridStep;
+        const step = Math.round((nextBeatRef.current-1.6) / subdivision);
         const noNearbyDetection = Math.abs(nextBeatRef.current-lastDetectedHitRef.current) > subdivision*.62;
-        const structuralBeat = difficulty===1 || step%2===0 || pulse>threshold;
-        if(noNearbyDetection && structuralBeat){
-          const lane=Math.abs(Math.floor(Math.sin(step*12.9898+trackIndex*7)*43758.5453))%4;
-          const stableSignal=spectrumRef.current.energy>.2 && spectrumRef.current.peak<spectrumRef.current.energy*2.8;
-          const isHold=difficulty>1 && step>4 && step%(difficulty===3?16:12)===0 && stableSignal;
-          addNote(nextBeatRef.current,lane,isHold,isHold?beat*2:0);
+        const activity=clamp(signal.intensity+signal.energy*.34+signal.flux*.7,0,1);
+        const primary=difficulty===1?true:difficulty===2?step%2===0:step%4===0;
+        const secondary=difficulty===2?step%2===1:step%2===0;
+        const relaxedGate=threshold*.42;
+        const structuralBeat=difficulty===1
+          ? activity>.52 || (activity>relaxedGate && step%2===0)
+          : difficulty===2
+            ? (primary && activity>relaxedGate) || (!primary && activity>.72 && pulse>threshold*.72)
+            : (primary && activity>relaxedGate*.75) || (secondary && activity>.46) || activity>.82;
+        if(noNearbyDetection && !signal.silence && structuralBeat){
+          const patterns=difficulty===1?[0,1,2,3,2,1]:difficulty===2?[0,2,1,3,3,1,2,0]:[0,3,1,2,2,1,3,0];
+          const lane=patterns[(step+trackIndex*2)%patterns.length];
+          const stableSignal=signal.pitchConfidence>.48 || (signal.energy>.18 && signal.peak<signal.energy*2.8);
+          const holdCycle=difficulty===1?12:difficulty===2?16:20;
+          const isHold=step>4 && step%holdCycle===0 && stableSignal;
+          const holdDuration=beat*(difficulty===1?1.25:difficulty===2?1.5:2.25);
+          addNote(nextBeatRef.current,lane,isHold,isHold?holdDuration:0);
         }
         nextBeatRef.current += subdivision;
       }
@@ -394,7 +476,7 @@ export default function Home() {
             <label><span>VOLUME %</span><input aria-label="Volume percent" type="number" min="0" max="150" step="1" value={volume} onChange={e=>{const nextVolume=clamp(+e.target.value||0,0,150);setVolume(nextVolume);schedulePreview(formula,{volume:nextVolume})}}/></label>
           </div>
           <label>DIFFICULTY <span>{["FLOW","PULSE","OVERDRIVE"][difficulty-1]}</span></label><div className="segments">{[1,2,3].map(n=><button aria-label={`Difficulty ${n}`} onClick={()=>setDifficulty(n)} className={difficulty===n?"on":""} key={n}/>)}</div>
-          <p className="difficulty-copy">{difficulty===1?"1 TILE / BEAT · NO HOLDS · ±220 ms":difficulty===2?"REACTIVE 1/2 BEATS · HOLDS · ±170 ms":"FULL TRANSIENT MAP · LONG HOLDS · ±140 ms"}</p>
+          <p className="difficulty-copy">{difficulty===1?"ADAPTIVE BEATS · SHORT HOLDS · ±220 ms":difficulty===2?"GROOVED 1/2 BEATS · LIGHT HOLDS · ±190 ms":"DYNAMIC TRANSIENT MAP · LONG HOLDS · ±140 ms"}</p>
           <label>MODIFIERS <span>{Object.values(modifiers).filter(Boolean).length || "OFF"}</span></label>
           <div className="modifier-grid">
             <button className={modifiers.auto?"on":""} onClick={()=>setModifiers(m=>({...m,auto:!m.auto}))}><b>AUTO</b><span>AUTOBOT</span><small>UNRANKED</small></button>
