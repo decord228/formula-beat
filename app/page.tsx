@@ -8,6 +8,7 @@ type Note = { id: number; lane: number; born: number; hitAt: number; kind: "tap"
 type Particle = { x: number; y: number; vx: number; vy: number; life: number; size: number };
 type RhythmEvent = { hitAt: number; lane: number; strength: number; hold: boolean; duration: number };
 type Modifiers = { auto: boolean; noFail: boolean; hidden: boolean };
+type FormulaSample = number | number[];
 
 const TRACKS: Track[] = [
   {
@@ -43,14 +44,14 @@ const clamp = (n: number, a: number, b: number) => Math.max(a, Math.min(b, n));
 
 function compileFormula(source: string) {
   const cleaned = source.replaceAll("\\*", "*").replaceAll("\\_", "_");
-  return new Function("t", "sr", "n", `
-    const {abs,acos,acosh,asin,asinh,atan,atan2,atanh,cbrt,ceil,cos,cosh,exp,expm1,floor,fround,hypot,imul,log,log10,log1p,log2,max,min,pow,random,round,sign,sin,sinh,sqrt,tan,tanh,trunc,PI,E,LN2,LN10,LOG2E,LOG10E,SQRT1_2,SQRT2}=Math;
+  return new Function("M", `
+    const {abs,acos,acosh,asin,asinh,atan,atan2,atanh,cbrt,ceil,cos,cosh,exp,expm1,floor,fround,hypot,imul,log,log10,log1p,log2,max,min,pow,random,round,sign,sin,sinh,sqrt,tan,tanh,trunc,PI,E,LN2,LN10,LOG2E,LOG10E,SQRT1_2,SQRT2}=M;
     const int=x=>x|0, ln=log;
-    const v=(${cleaned}); return Array.isArray(v) ? v : [v,v];
-  `) as (t: number, sr: number, n: number) => number[];
+    return function(t,sr,n){ return (${cleaned}); };
+  `)(Math) as (t: number, sr: number, n: number) => FormulaSample;
 }
 
-function evaluateFormula(fn: ReturnType<typeof compileFormula>, t: number, sr: number, n: number, fallback: number[] = [0,0]) {
+function evaluateFormula(fn: ReturnType<typeof compileFormula>, t: number, sr: number, n: number, fallback: FormulaSample = 0) {
   try { return fn(t, sr, n); }
   catch (value) {
     // Several classic bytebeat formulas intentionally throw strings as a
@@ -126,7 +127,7 @@ export default function Home() {
     const n = override?.n ?? nValue;
     const outputVolume = override?.volume ?? volume;
     let fn: ReturnType<typeof compileFormula>;
-    try { fn = compileFormula(source); let testSample=[0,0]; for (let i = 0; i < 32; i++) testSample=evaluateFormula(fn,i * 257,hz,n,testSample); }
+    try { fn = compileFormula(source); let testSample: FormulaSample=0; for (let i = 0; i < 32; i++) testSample=evaluateFormula(fn,i * 257,hz,n,testSample); }
     catch { setStatus("FORMULA ERROR"); return false; }
     const ctx = new AudioContext({ latencyHint: "interactive" });
     try { await ctx.resume(); } catch { setStatus("CLICK PREVIEW TO ENABLE AUDIO"); return false; }
@@ -137,19 +138,22 @@ export default function Home() {
     delay.delayTime.value = kind === "game" ? 1.6 : 0;
     gain.gain.value = clamp(outputVolume / 100, 0, 1.5) * (kind === "preview" ? .22 : 1);
     playbackSpeedRef.current=1;
-    let tick = 0; let lastFormulaTick = -1; let cachedResult: number[] = [0,0]; let runtimeFailed = false;
+    let tick = 0; let lastFormulaTick = -1; let cachedResult: FormulaSample = 0; let runtimeFailed = false;
+    let renderStride=1;let callbackLoad=0;
     let previousMono = 0; let previousEnergy = 0; let adaptiveFlux = .025; let lastOnsetAt = -10; let eventIndex = 0;
     processor.onaudioprocess = (event) => {
+      const callbackStarted=performance.now();
       const left = event.outputBuffer.getChannelData(0);
       const right = event.outputBuffer.getChannelData(1);
       let energy = 0; let peak = 0; let flux = 0;
       try {
         for (let i = 0; i < left.length; i++) {
           const formulaTick = Math.floor(tick);
-          if (formulaTick !== lastFormulaTick) { lastFormulaTick = formulaTick; cachedResult = evaluateFormula(fn,formulaTick,hz,n,cachedResult); }
+          if (formulaTick !== lastFormulaTick && (renderStride===1 || i%renderStride===0)) { lastFormulaTick = formulaTick; cachedResult = evaluateFormula(fn,formulaTick,hz,n,cachedResult); }
           tick += hz / ctx.sampleRate * playbackSpeedRef.current;
-          const l = normalizeSample(Number(cachedResult?.[0] ?? 0), mode);
-          const r = normalizeSample(Number(cachedResult?.[1] ?? l), mode);
+          const stereo=Array.isArray(cachedResult);const rawLeft=stereo?cachedResult[0]:cachedResult;const rawRight=stereo?(cachedResult[1]??rawLeft):rawLeft;
+          const l = normalizeSample(Number(rawLeft ?? 0), mode);
+          const r = normalizeSample(Number(rawRight ?? l), mode);
           left[i] = l; right[i] = r;
           const mono = (l + r) / 2; flux += Math.abs(mono - previousMono); previousMono = mono;
           const amp = (Math.abs(l) + Math.abs(r)) / 2;
@@ -160,6 +164,8 @@ export default function Home() {
         left.fill(0); right.fill(0);
         if (!runtimeFailed) { runtimeFailed = true; const message = error instanceof Error ? error.message : "unknown error"; setStatus(`RUNTIME ERROR: ${message.toUpperCase().slice(0,48)}`); }
       }
+      const callbackBudget=left.length/ctx.sampleRate*1000;callbackLoad=callbackLoad*.88+(performance.now()-callbackStarted)/callbackBudget*.12;
+      if(hz>=ctx.sampleRate*.75){if(callbackLoad>.82)renderStride=4;else if(callbackLoad>.58)renderStride=2;else if(callbackLoad<.32)renderStride=1}
       spectrumRef.current.energy = energy / left.length;
       spectrumRef.current.peak = peak;
       const blockEnergy = energy / left.length; const blockFlux = flux / left.length;
@@ -257,6 +263,7 @@ export default function Home() {
   useEffect(() => {
     if (game !== "running") return;
     const beat = 60 / track.bpm;
+    let lastUiAt = -1;
     const loop = () => {
       const now = (performance.now() - startRef.current) / 1000;
       const addNote = (hitAt: number, desiredLane: number, hold: boolean, duration: number) => {
@@ -309,7 +316,7 @@ export default function Home() {
         }
       }
       notesRef.current = notesRef.current.filter(n => now - (n.hitAt + n.duration) < .75);
-      setNotes([...notesRef.current]);
+      if(now-lastUiAt>=1/45){lastUiAt=now;setNotes([...notesRef.current])}
       rafRef.current = requestAnimationFrame(loop);
     };
     rafRef.current = requestAnimationFrame(loop); return () => cancelAnimationFrame(rafRef.current);
@@ -333,7 +340,7 @@ export default function Home() {
     const ctx = canvas.getContext("2d"); if (!ctx) return;
     let frame = 0; let animationId = 0;
     const draw = () => {
-      const rect = canvas.getBoundingClientRect(); const dpr = Math.min(devicePixelRatio, 2);
+      const rect = canvas.getBoundingClientRect(); const dpr = Math.min(devicePixelRatio, game==="setup"?2:1.5);
       if (canvas.width !== rect.width * dpr || canvas.height !== rect.height * dpr) { canvas.width = rect.width * dpr; canvas.height = rect.height * dpr; }
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0); const w = rect.width, h = rect.height;
       ctx.fillStyle = "#050605"; ctx.fillRect(0, 0, w, h);
