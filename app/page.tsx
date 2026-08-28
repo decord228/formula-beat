@@ -23,6 +23,11 @@ const TRACKS: Track[] = [
     blurb: "Sub pressure / fractured hats", mode: "floatbeat", hz: 48000, n: 1, volume: 68,
     formula: "tanh(sin((t*n*2**('03202222222222270320222222233330'[(t>>13)&31]/12))/75)*.35 + cos(sqrt(t%8192))*pow(1-(t%8192)/8192,3)*1.4 + (random()-.5)*pow(1-(t%4096)/4096,7)*.25)",
   },
+  {
+    name: "LOG CHOIR", author: "formula 04", bpm: 120, color: "#ffb000",
+    blurb: "Logarithmic stereo swarm", mode: "bytebeat", hz: 8000, n: 1, volume: 56,
+    formula: "H=i=128,s=t/5e3,o=[H,H],F=i=>((57454323>>4*i&31)-(s>>3&4))/12,(e=>{while(i--)o[i%2]+=sin(40*log(s%4)+9*s)/3+s%4*(exp(-s%1*2)*((t*2**[F(7)-2,5+i/90,F(~~s-4*(i<48))+i%4/H][i%3]+s%1*i/5&H)-64)+(t*2**(F(i%7)-(i/2&1))+1e4*sin(i+s/H))%H-64)/H})(),o",
+  },
 ];
 
 const LANES = ["D", "F", "J", "K"];
@@ -31,7 +36,8 @@ const clamp = (n: number, a: number, b: number) => Math.max(a, Math.min(b, n));
 function compileFormula(source: string) {
   const cleaned = source.replaceAll("\\*", "*").replaceAll("\\_", "_");
   return new Function("t", "sr", "n", `
-    const {sin,cos,tan,tanh,asin,sqrt,pow,min,max,abs,round,floor,PI,random}=Math;
+    const {abs,acos,acosh,asin,asinh,atan,atan2,atanh,cbrt,ceil,cos,cosh,exp,expm1,floor,fround,hypot,imul,log,log10,log1p,log2,max,min,pow,random,round,sign,sin,sinh,sqrt,tan,tanh,trunc,PI,E,LN2,LN10,LOG2E,LOG10E,SQRT1_2,SQRT2}=Math;
+    const int=x=>x|0, ln=log;
     const v=(${cleaned}); return Array.isArray(v) ? v : [v,v];
   `) as (t: number, sr: number, n: number) => number[];
 }
@@ -98,22 +104,27 @@ export default function Home() {
     const delay = ctx.createDelay(3);
     delay.delayTime.value = kind === "game" ? 1.6 : 0;
     gain.gain.value = clamp(outputVolume / 100, 0, 1.5) * (kind === "preview" ? .22 : 1);
-    let tick = 0;
+    let tick = 0; let lastFormulaTick = -1; let cachedResult: number[] = [0,0]; let runtimeFailed = false;
     processor.onaudioprocess = (event) => {
       const left = event.outputBuffer.getChannelData(0);
       const right = event.outputBuffer.getChannelData(1);
       let energy = 0; let peak = 0;
       try {
         for (let i = 0; i < left.length; i++) {
-          const result = fn(tick, hz, n); tick += hz / ctx.sampleRate;
-          const l = normalizeSample(Number(result?.[0] ?? 0), mode);
-          const r = normalizeSample(Number(result?.[1] ?? l), mode);
+          const formulaTick = Math.floor(tick);
+          if (formulaTick !== lastFormulaTick) { cachedResult = fn(formulaTick, hz, n); lastFormulaTick = formulaTick; }
+          tick += hz / ctx.sampleRate;
+          const l = normalizeSample(Number(cachedResult?.[0] ?? 0), mode);
+          const r = normalizeSample(Number(cachedResult?.[1] ?? l), mode);
           left[i] = l; right[i] = r;
           const amp = (Math.abs(l) + Math.abs(r)) / 2;
           energy += amp; peak = Math.max(peak, amp);
           if (i % 8 === 0) spectrumRef.current.wave[(i / 8) % 128] = (l + r) / 2;
         }
-      } catch { left.fill(0); right.fill(0); }
+      } catch (error) {
+        left.fill(0); right.fill(0);
+        if (!runtimeFailed) { runtimeFailed = true; const message = error instanceof Error ? error.message : "unknown error"; setStatus(`RUNTIME ERROR: ${message.toUpperCase().slice(0,48)}`); }
+      }
       spectrumRef.current.energy = energy / left.length;
       spectrumRef.current.peak = peak;
     };
@@ -260,7 +271,7 @@ export default function Home() {
       {game === "setup" && <section className="setup-shell">
         <div className="intro"><p className="eyebrow">BYTEBEAT RHYTHM SYSTEM</p><h1>TURN CODE<br/><em>INTO RHYTHM.</em></h1><p className="lead">Каждая формула — одновременно музыка, визуальная система и новая игровая карта.</p></div>
         <div className="track-panel">
-          <div className="panel-title"><span>01</span><div><b>SELECT SIGNAL</b><small>3 FORMULAS LOADED</small></div></div>
+          <div className="panel-title"><span>01</span><div><b>SELECT SIGNAL</b><small>{TRACKS.length} FORMULAS LOADED</small></div></div>
           <div className="track-list">{TRACKS.map((item,i)=><button key={item.name} onClick={()=>chooseTrack(i)} className={i===trackIndex?"selected":""}><span className="num">0{i+1}</span><div><b>{item.name}</b><small>{item.blurb} · {item.mode}</small></div><span className="bpm">{item.bpm}<small>BPM</small></span></button>)}</div>
         </div>
         <div className="visual-card"><canvas ref={canvasRef}/><div className="visual-label"><span>LIVE SIGNAL</span><b>{track.name}</b></div><div className="reticle">+</div></div>
