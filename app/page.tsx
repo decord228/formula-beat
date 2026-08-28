@@ -50,6 +50,16 @@ function compileFormula(source: string) {
   `) as (t: number, sr: number, n: number) => number[];
 }
 
+function evaluateFormula(fn: ReturnType<typeof compileFormula>, t: number, sr: number, n: number, fallback: number[] = [0,0]) {
+  try { return fn(t, sr, n); }
+  catch (value) {
+    // Several classic bytebeat formulas intentionally throw strings as a
+    // debug console (melody/kick/snare readouts). That is metadata, not audio failure.
+    if (typeof value === "string") return fallback;
+    throw value;
+  }
+}
+
 function normalizeSample(value: number, mode: SignalMode) {
   if (!Number.isFinite(value)) return 0;
   if (mode === "floatbeat") return clamp(value, -1, 1);
@@ -116,7 +126,7 @@ export default function Home() {
     const n = override?.n ?? nValue;
     const outputVolume = override?.volume ?? volume;
     let fn: ReturnType<typeof compileFormula>;
-    try { fn = compileFormula(source); for (let i = 0; i < 32; i++) fn(i * 257, hz, n); }
+    try { fn = compileFormula(source); let testSample=[0,0]; for (let i = 0; i < 32; i++) testSample=evaluateFormula(fn,i * 257,hz,n,testSample); }
     catch { setStatus("FORMULA ERROR"); return false; }
     const ctx = new AudioContext({ latencyHint: "interactive" });
     try { await ctx.resume(); } catch { setStatus("CLICK PREVIEW TO ENABLE AUDIO"); return false; }
@@ -136,7 +146,7 @@ export default function Home() {
       try {
         for (let i = 0; i < left.length; i++) {
           const formulaTick = Math.floor(tick);
-          if (formulaTick !== lastFormulaTick) { cachedResult = fn(formulaTick, hz, n); lastFormulaTick = formulaTick; }
+          if (formulaTick !== lastFormulaTick) { lastFormulaTick = formulaTick; cachedResult = evaluateFormula(fn,formulaTick,hz,n,cachedResult); }
           tick += hz / ctx.sampleRate * playbackSpeedRef.current;
           const l = normalizeSample(Number(cachedResult?.[0] ?? 0), mode);
           const r = normalizeSample(Number(cachedResult?.[1] ?? l), mode);
@@ -381,7 +391,7 @@ export default function Home() {
           <button className="preview-button" onClick={()=>audioRef.current?.kind === "preview" ? stopAudio() : void startAudio("preview")}>{audioRef.current?.kind === "preview" ? "■ STOP PREVIEW" : "▶ QUIET PREVIEW"}</button>
           <button className="launch" onClick={launch}><span>INITIALIZE RUN</span><b>↗</b></button><p className="hint">KEYS&nbsp; D · F · J · K &nbsp;/&nbsp; TOUCH</p>
         </div>
-        <details className="formula-panel"><summary><span>03</span><b>FORMULA SOURCE</b><small>EDIT / PASTE BYTEBEAT</small></summary><textarea spellCheck={false} value={formula} onChange={e=>{const value=e.target.value;setFormula(value);setStatus("COMPILING PREVIEW");schedulePreview(value)}}/><div className="mode-help"><b>{signalMode.toUpperCase()}</b><span>{signalMode === "bytebeat" ? "0…255 → преобразуется в −1…1" : signalMode === "signed" ? "−128…127 → преобразуется в −1…1" : "готовый сигнал −1…1 без 8-битного преобразования"}</span></div><div className="editor-foot"><span>JS EXPRESSION · t, sr, n AVAILABLE</span><button onClick={()=>{try{const test=compileFormula(formula);for(let i=0;i<32;i++)test(i*257,formulaHz,nValue);setStatus("FORMULA READY");void startAudio("preview")}catch{setStatus("FORMULA ERROR")}}}>CHECK + PREVIEW</button></div></details>
+        <details className="formula-panel"><summary><span>03</span><b>FORMULA SOURCE</b><small>EDIT / PASTE BYTEBEAT</small></summary><textarea spellCheck={false} value={formula} onChange={e=>{const value=e.target.value;setFormula(value);setStatus("COMPILING PREVIEW");schedulePreview(value)}}/><div className="mode-help"><b>{signalMode.toUpperCase()}</b><span>{signalMode === "bytebeat" ? "0…255 → преобразуется в −1…1" : signalMode === "signed" ? "−128…127 → преобразуется в −1…1" : "готовый сигнал −1…1 без 8-битного преобразования"}</span></div><div className="editor-foot"><span>JS EXPRESSION · t, sr, n AVAILABLE · DEBUG THROW SAFE</span><button onClick={()=>void startAudio("preview")}>CHECK + PREVIEW</button></div></details>
       </section>}
 
       {game !== "setup" && <section className={`game-shell ${game} ${modifiers.hidden?"hidden-mod":""}`}>
