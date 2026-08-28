@@ -7,6 +7,7 @@ type Track = { name: string; author: string; bpm: number; color: string; formula
 type Note = { id: number; lane: number; born: number; hitAt: number; kind: "tap" | "hold"; duration: number; pressed?: boolean; hit?: boolean; missed?: boolean };
 type Particle = { x: number; y: number; vx: number; vy: number; life: number; size: number };
 type RhythmEvent = { hitAt: number; lane: number; strength: number; hold: boolean; duration: number };
+type Modifiers = { auto: boolean; noFail: boolean; hidden: boolean };
 
 const TRACKS: Track[] = [
   {
@@ -66,7 +67,8 @@ export default function Home() {
   const [formulaHz, setFormulaHz] = useState(TRACKS[0].hz);
   const [nValue, setNValue] = useState(TRACKS[0].n);
   const [volume, setVolume] = useState(TRACKS[0].volume);
-  const [game, setGame] = useState<"setup" | "running" | "results">("setup");
+  const [game, setGame] = useState<"setup" | "running" | "failing" | "results">("setup");
+  const [modifiers, setModifiers] = useState<Modifiers>({auto:false,noFail:false,hidden:false});
   const [score, setScore] = useState(0);
   const [combo, setCombo] = useState(0);
   const [health, setHealth] = useState(100);
@@ -77,7 +79,7 @@ export default function Home() {
   const [timingMs, setTimingMs] = useState<number | null>(null);
   const [pressedLanes, setPressedLanes] = useState<boolean[]>([false,false,false,false]);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const audioRef = useRef<{ ctx: AudioContext; processor: ScriptProcessorNode; gain: GainNode; kind: "preview" | "game" } | null>(null);
+  const audioRef = useRef<{ ctx: AudioContext; processor: ScriptProcessorNode; filter: BiquadFilterNode; gain: GainNode; kind: "preview" | "game" } | null>(null);
   const previewTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const notesRef = useRef<Note[]>([]);
   const startRef = useRef(0);
@@ -90,15 +92,21 @@ export default function Home() {
   const gameActiveRef = useRef(false);
   const laneBusyUntilRef = useRef([0,0,0,0]);
   const lastDetectedHitRef = useRef(-10);
+  const playbackSpeedRef = useRef(1);
+  const freezeTimeRef = useRef(0);
   const track = TRACKS[trackIndex];
 
   const stopAudio = useCallback(() => {
     gameActiveRef.current = false;
     const audio = audioRef.current;
-    if (audio) { audio.processor.disconnect(); audio.gain.disconnect(); void audio.ctx.close(); }
+    if (audio) { audio.processor.disconnect(); audio.filter.disconnect(); audio.gain.disconnect(); void audio.ctx.close(); }
     audioRef.current = null;
     setAudioOn(false);
   }, []);
+
+  const damageSync = useCallback((amount: number) => {
+    setHealth(value => modifiers.noFail ? Math.max(1,value-amount) : clamp(value-amount,0,100));
+  }, [modifiers.noFail]);
 
   const startAudio = useCallback(async (kind: "preview" | "game" = "game", override?: Partial<{ formula: string; mode: SignalMode; hz: number; n: number; volume: number }>) => {
     stopAudio();
@@ -114,9 +122,11 @@ export default function Home() {
     try { await ctx.resume(); } catch { setStatus("CLICK PREVIEW TO ENABLE AUDIO"); return false; }
     const processor = ctx.createScriptProcessor(1024, 0, 2);
     const gain = ctx.createGain();
+    const filter = ctx.createBiquadFilter(); filter.type="lowpass"; filter.frequency.value=20000; filter.Q.value=.4;
     const delay = ctx.createDelay(3);
     delay.delayTime.value = kind === "game" ? 1.6 : 0;
     gain.gain.value = clamp(outputVolume / 100, 0, 1.5) * (kind === "preview" ? .22 : 1);
+    playbackSpeedRef.current=1;
     let tick = 0; let lastFormulaTick = -1; let cachedResult: number[] = [0,0]; let runtimeFailed = false;
     let previousMono = 0; let previousEnergy = 0; let adaptiveFlux = .025; let lastOnsetAt = -10; let eventIndex = 0;
     processor.onaudioprocess = (event) => {
@@ -127,7 +137,7 @@ export default function Home() {
         for (let i = 0; i < left.length; i++) {
           const formulaTick = Math.floor(tick);
           if (formulaTick !== lastFormulaTick) { cachedResult = fn(formulaTick, hz, n); lastFormulaTick = formulaTick; }
-          tick += hz / ctx.sampleRate;
+          tick += hz / ctx.sampleRate * playbackSpeedRef.current;
           const l = normalizeSample(Number(cachedResult?.[0] ?? 0), mode);
           const r = normalizeSample(Number(cachedResult?.[1] ?? l), mode);
           left[i] = l; right[i] = r;
@@ -158,8 +168,8 @@ export default function Home() {
       }
       previousEnergy = blockEnergy;
     };
-    processor.connect(delay); delay.connect(gain); gain.connect(ctx.destination);
-    audioRef.current = { ctx, processor, gain, kind };
+    processor.connect(delay); delay.connect(filter); filter.connect(gain); gain.connect(ctx.destination);
+    audioRef.current = { ctx, processor, filter, gain, kind };
     setAudioOn(true); setStatus(kind === "preview" ? "QUIET PREVIEW" : "SIGNAL LOCKED");
     return true;
   }, [difficulty, formula, formulaHz, nValue, signalMode, track.bpm, volume, stopAudio]);
@@ -179,7 +189,7 @@ export default function Home() {
     const ok = await startAudio("game"); if (!ok) return;
     notesRef.current = []; particlesRef.current = []; rhythmEventsRef.current = []; laneBusyUntilRef.current = [0,0,0,0]; lastDetectedHitRef.current = -10;
     setNotes([]); setScore(0); setCombo(0); setHealth(100); setPressedLanes([false,false,false,false]); setTimingMs(null);
-    startRef.current = performance.now(); nextBeatRef.current = 1.6; idRef.current = 1; gameActiveRef.current = true;
+    startRef.current = performance.now(); freezeTimeRef.current=0; nextBeatRef.current = 1.6; idRef.current = 1; playbackSpeedRef.current=1; gameActiveRef.current = true;
     setGame("running"); setLastJudgement("SYNC");
   };
 
@@ -190,7 +200,7 @@ export default function Home() {
   }, []);
 
   const pressLane = useCallback((lane: number) => {
-    if (game !== "running") return;
+    if (game !== "running" || modifiers.auto) return;
     setPressedLanes(v => v.map((pressed,i)=>i===lane?true:pressed));
     const timing = TIMING_WINDOWS[difficulty-1];
     const now = (performance.now() - startRef.current) / 1000;
@@ -211,11 +221,11 @@ export default function Home() {
     setTimingMs(Math.round(offset*1000)); setCombo(v => v + 1); setScore(v => v + pts); setHealth(v => clamp(v + 1.2, 0, 100));
     burst(lane, best.kind === "hold" ? 10 : 18);
     setNotes([...notesRef.current]);
-  }, [burst, difficulty, game]);
+  }, [burst, difficulty, game, modifiers.auto]);
 
   const releaseLane = useCallback((lane: number) => {
     setPressedLanes(v => v.map((pressed,i)=>i===lane?false:pressed));
-    if (game !== "running") return;
+    if (game !== "running" || modifiers.auto) return;
     const now = (performance.now() - startRef.current) / 1000;
     const hold = notesRef.current.find(note => note.lane===lane && note.kind==="hold" && note.pressed && !note.hit && !note.missed);
     if (!hold) return;
@@ -223,10 +233,10 @@ export default function Home() {
     if (now >= hold.hitAt + hold.duration - .16) {
       hold.hit = true; setTimingMs(Math.round((now-(hold.hitAt+hold.duration))*1000)); setScore(v=>v+Math.round(1200+hold.duration*900)); setCombo(v=>v+1); setLastJudgement("RELEASE"); setHealth(v=>clamp(v+3,0,100)); burst(lane,28);
     } else {
-      hold.missed = true; setTimingMs(Math.round((now-(hold.hitAt+hold.duration))*1000)); setCombo(0); setLastJudgement("EARLY"); setHealth(v=>clamp(v-10,0,100));
+      hold.missed = true; setTimingMs(Math.round((now-(hold.hitAt+hold.duration))*1000)); setCombo(0); setLastJudgement("EARLY"); damageSync(10);
     }
     setNotes([...notesRef.current]);
-  }, [burst, game]);
+  }, [burst, damageSync, game, modifiers.auto]);
 
   useEffect(() => {
     const down = (e: KeyboardEvent) => { const i = LANES.indexOf(e.key.toUpperCase()); if (i >= 0 && !e.repeat) pressLane(i); if (e.key === "Escape" && game === "running") { stopAudio(); setGame("setup"); } };
@@ -274,11 +284,18 @@ export default function Home() {
         }
         nextBeatRef.current += subdivision;
       }
+      if(modifiers.auto){
+        for(const note of notesRef.current){
+          if(note.hit||note.missed||now<note.hitAt) continue;
+          if(note.kind==="hold"&&!note.pressed){note.pressed=true;setPressedLanes(v=>v.map((pressed,i)=>i===note.lane?true:pressed));setLastJudgement("AUTO HOLD");setTimingMs(0);setScore(v=>v+1000);setCombo(v=>v+1);burst(note.lane,10)}
+          else if(note.kind==="tap"){note.hit=true;setLastJudgement("AUTO");setTimingMs(0);setScore(v=>v+1000);setCombo(v=>v+1);burst(note.lane,16)}
+        }
+      }
       for (const note of notesRef.current) {
         if (note.kind === "hold" && note.pressed && !note.hit && !note.missed && now >= note.hitAt + note.duration) {
-          note.pressed = false; note.hit = true; setTimingMs(0); setScore(v=>v+Math.round(1200+note.duration*900)); setCombo(v=>v+1); setLastJudgement("HELD"); setHealth(v=>clamp(v+3,0,100)); burst(note.lane,28);
+          note.pressed = false; note.hit = true; setPressedLanes(v=>v.map((pressed,i)=>i===note.lane?false:pressed)); setTimingMs(0); setScore(v=>v+Math.round(1200+note.duration*900)); setCombo(v=>v+1); setLastJudgement(modifiers.auto?"AUTO RELEASE":"HELD"); setHealth(v=>clamp(v+3,0,100)); burst(note.lane,28);
         } else if (!note.hit && !note.missed && !note.pressed && now - note.hitAt > TIMING_WINDOWS[difficulty-1].hit) {
-          note.missed = true; setTimingMs(null); setCombo(0); setHealth(v => clamp(v - TIMING_WINDOWS[difficulty-1].missDamage, 0, 100)); setLastJudgement("MISS");
+          note.missed = true; setTimingMs(null); setCombo(0); damageSync(TIMING_WINDOWS[difficulty-1].missDamage); setLastJudgement("MISS");
         }
       }
       notesRef.current = notesRef.current.filter(n => now - (n.hitAt + n.duration) < .75);
@@ -286,7 +303,20 @@ export default function Home() {
       rafRef.current = requestAnimationFrame(loop);
     };
     rafRef.current = requestAnimationFrame(loop); return () => cancelAnimationFrame(rafRef.current);
-  }, [game, difficulty, sensitivity, track.bpm, trackIndex, burst]);
+  }, [game, difficulty, sensitivity, track.bpm, trackIndex, burst, damageSync, modifiers.auto]);
+
+  useEffect(()=>{
+    if(game==="running"&&health<=0&&!modifiers.noFail){
+      freezeTimeRef.current=(performance.now()-startRef.current)/1000;gameActiveRef.current=false;setLastJudgement("DESYNC");setTimingMs(null);setStatus("SIGNAL COLLAPSE");setGame("failing");
+    }
+  },[game,health,modifiers.noFail]);
+
+  useEffect(()=>{
+    if(game!=="failing")return;
+    const started=performance.now();let animationId=0;
+    const collapse=()=>{const progress=clamp((performance.now()-started)/2500,0,1);playbackSpeedRef.current=Math.pow(1-progress,2);const audio=audioRef.current;if(audio){audio.filter.frequency.setTargetAtTime(90+Math.pow(1-progress,2)*19910,audio.ctx.currentTime,.06);audio.gain.gain.setTargetAtTime(Math.max(.015,(1-progress)*volume/100),audio.ctx.currentTime,.08)}if(progress<1)animationId=requestAnimationFrame(collapse);else{stopAudio();setStatus("SIGNAL LOST");setGame("results")}};
+    animationId=requestAnimationFrame(collapse);return()=>cancelAnimationFrame(animationId);
+  },[game,stopAudio,volume]);
 
   useEffect(() => {
     const canvas = canvasRef.current; if (!canvas) return;
@@ -298,17 +328,17 @@ export default function Home() {
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0); const w = rect.width, h = rect.height;
       ctx.fillStyle = "#050605"; ctx.fillRect(0, 0, w, h);
       const signal = spectrumRef.current; const wave = signal.wave; const energy = signal.energy;
-      const grad = ctx.createRadialGradient(w*.5,h*(game==="running"?.68:.55),0,w*.5,h*.55,w*.72); grad.addColorStop(0,track.color+(game==="running"?"35":"20")); grad.addColorStop(.46,track.color+"0d"); grad.addColorStop(1,"transparent"); ctx.fillStyle=grad; ctx.fillRect(0,0,w,h);
-      if(game==="running"){
+      const inGame=game!=="setup";const grad = ctx.createRadialGradient(w*.5,h*(inGame?.68:.55),0,w*.5,h*.55,w*.72); grad.addColorStop(0,track.color+(inGame?"35":"20")); grad.addColorStop(.46,track.color+"0d"); grad.addColorStop(1,"transparent"); ctx.fillStyle=grad; ctx.fillRect(0,0,w,h);
+      if(inGame){
         ctx.save(); ctx.strokeStyle=track.color; ctx.globalAlpha=.08+energy*.12; ctx.lineWidth=1;
         for(let i=-9;i<=9;i++){ctx.beginPath();ctx.moveTo(w/2,h*.35);ctx.lineTo(w/2+i*w*.085,h);ctx.stroke()}
         for(let i=0;i<8;i++){const y=h*.38+Math.pow(i/7,1.7)*h*.62;ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke()} ctx.restore();
       }
       ctx.save(); ctx.globalCompositeOperation="lighter";
-      const bars=48; for(let i=0;i<bars;i++){const amp=Math.abs(wave[(i*2)%wave.length]);const bh=(.015+amp*.75+energy*.18)*h*(game==="running"?.34:.22);const x=i/(bars-1)*w;ctx.globalAlpha=.1+amp*.55;ctx.fillStyle=track.color;ctx.fillRect(x-w/bars*.28,h*.54-bh/2,w/bars*.56,bh)}
+      const bars=48; for(let i=0;i<bars;i++){const amp=Math.abs(wave[(i*2)%wave.length]);const bh=(.015+amp*.75+energy*.18)*h*(inGame?.34:.22);const x=i/(bars-1)*w;ctx.globalAlpha=.1+amp*.55;ctx.fillStyle=track.color;ctx.fillRect(x-w/bars*.28,h*.54-bh/2,w/bars*.56,bh)}
       for(let layer=0;layer<3;layer++){ctx.beginPath();for(let i=0;i<wave.length;i++){const x=i/(wave.length-1)*w;const y=h*.54+wave[i]*h*(.10+layer*.055);i?ctx.lineTo(x,y):ctx.moveTo(x,y)}ctx.globalAlpha=.55-layer*.15;ctx.strokeStyle=track.color;ctx.lineWidth=layer===0?2:1;ctx.shadowBlur=20;ctx.shadowColor=track.color;ctx.stroke()}
       ctx.shadowBlur=0; for(let ring=0;ring<6;ring++){const limit=Math.min(w,h)*.7;const r=(frame*(1.1+energy*3)+ring*limit/6)%limit;ctx.beginPath();ctx.arc(w/2,h*.54,r,0,Math.PI*2);ctx.globalAlpha=(1-r/limit)*(.22+energy*.28);ctx.strokeStyle=track.color;ctx.lineWidth=1+energy*2;ctx.stroke()}
-      if(game==="running"){
+      if(inGame){
         particlesRef.current=particlesRef.current.filter(p=>p.life>0);
         for(const p of particlesRef.current){p.x+=p.vx;p.y+=p.vy;p.vy+=.14;p.life-=.025;ctx.globalAlpha=p.life;ctx.fillStyle=track.color;ctx.shadowBlur=12;ctx.shadowColor=track.color;ctx.fillRect(p.x,p.y,p.size,p.size)}
       }
@@ -318,7 +348,7 @@ export default function Home() {
 
   useEffect(() => () => stopAudio(), [stopAudio]);
 
-  const timeline = useMemo(() => game === "running" ? (performance.now() - startRef.current) / 1000 : 0, [game, notes]);
+  const timeline = useMemo(() => game === "running" ? (performance.now() - startRef.current) / 1000 : freezeTimeRef.current, [game, notes]);
 
   return (
     <main style={{ "--accent": track.color } as React.CSSProperties}>
@@ -341,6 +371,12 @@ export default function Home() {
           </div>
           <label>DIFFICULTY <span>{["FLOW","PULSE","OVERDRIVE"][difficulty-1]}</span></label><div className="segments">{[1,2,3].map(n=><button aria-label={`Difficulty ${n}`} onClick={()=>setDifficulty(n)} className={difficulty===n?"on":""} key={n}/>)}</div>
           <p className="difficulty-copy">{difficulty===1?"1 TILE / BEAT · NO HOLDS · ±220 ms":difficulty===2?"REACTIVE 1/2 BEATS · HOLDS · ±170 ms":"FULL TRANSIENT MAP · LONG HOLDS · ±140 ms"}</p>
+          <label>MODIFIERS <span>{Object.values(modifiers).filter(Boolean).length || "OFF"}</span></label>
+          <div className="modifier-grid">
+            <button className={modifiers.auto?"on":""} onClick={()=>setModifiers(m=>({...m,auto:!m.auto}))}><b>AUTO</b><span>AUTOBOT</span><small>UNRANKED</small></button>
+            <button className={modifiers.noFail?"on":""} onClick={()=>setModifiers(m=>({...m,noFail:!m.noFail}))}><b>NF</b><span>NO FAIL</span><small>SYNC ≥ 1%</small></button>
+            <button className={modifiers.hidden?"on":""} onClick={()=>setModifiers(m=>({...m,hidden:!m.hidden}))}><b>HD</b><span>HIDDEN</span><small>FADE NOTES</small></button>
+          </div>
           <label>SIGNAL SENSITIVITY <span>{sensitivity}%</span></label><input type="range" min="30" max="90" value={sensitivity} onChange={e=>setSensitivity(+e.target.value)}/>
           <button className="preview-button" onClick={()=>audioRef.current?.kind === "preview" ? stopAudio() : void startAudio("preview")}>{audioRef.current?.kind === "preview" ? "■ STOP PREVIEW" : "▶ QUIET PREVIEW"}</button>
           <button className="launch" onClick={launch}><span>INITIALIZE RUN</span><b>↗</b></button><p className="hint">KEYS&nbsp; D · F · J · K &nbsp;/&nbsp; TOUCH</p>
@@ -348,12 +384,13 @@ export default function Home() {
         <details className="formula-panel"><summary><span>03</span><b>FORMULA SOURCE</b><small>EDIT / PASTE BYTEBEAT</small></summary><textarea spellCheck={false} value={formula} onChange={e=>{const value=e.target.value;setFormula(value);setStatus("COMPILING PREVIEW");schedulePreview(value)}}/><div className="mode-help"><b>{signalMode.toUpperCase()}</b><span>{signalMode === "bytebeat" ? "0…255 → преобразуется в −1…1" : signalMode === "signed" ? "−128…127 → преобразуется в −1…1" : "готовый сигнал −1…1 без 8-битного преобразования"}</span></div><div className="editor-foot"><span>JS EXPRESSION · t, sr, n AVAILABLE</span><button onClick={()=>{try{const test=compileFormula(formula);for(let i=0;i<32;i++)test(i*257,formulaHz,nValue);setStatus("FORMULA READY");void startAudio("preview")}catch{setStatus("FORMULA ERROR")}}}>CHECK + PREVIEW</button></div></details>
       </section>}
 
-      {game === "running" && <section className="game-shell">
+      {game !== "setup" && <section className={`game-shell ${game} ${modifiers.hidden?"hidden-mod":""}`}>
         <canvas ref={canvasRef} className="game-bg"/>
-        <div className="game-hud"><div><small>SCORE</small><b>{score.toString().padStart(7,"0")}</b></div><div className="now-playing"><i/><span>{track.name}<small>{track.bpm} BPM · {signalMode.toUpperCase()} · {formulaHz} Hz · n {nValue}</small></span></div><div className="hp"><small>SYNC</small><span><i style={{width:`${health}%`}}/></span></div></div>
-        <div className="highway"><div className="hit-guide"><span>HIT ZONE</span><small>PERFECT ±{Math.round(TIMING_WINDOWS[difficulty-1].perfect*1000)} ms</small></div>{LANES.map((key,lane)=><button key={key} onPointerDown={e=>{e.currentTarget.setPointerCapture(e.pointerId);pressLane(lane)}} onPointerUp={()=>releaseLane(lane)} onPointerCancel={()=>releaseLane(lane)} className={`lane ${pressedLanes[lane]?"pressed":""}`}><span className="rail"/><b>{key}</b>{notes.filter(n=>n.lane===lane).map(n=>{const travel=1-(n.hitAt-timeline)/1.6;const p=clamp(travel,-.15,1+n.duration/1.6+.2);return <i key={n.id} className={`note ${n.kind} ${n.pressed?"holding":""} ${n.hit?"hit":""} ${n.missed?"missed":""}`} style={{top:`${p*JUDGE_POSITION}%`,height:n.kind==="hold"?`${Math.max(10,n.duration/1.6*JUDGE_POSITION)}%`:undefined}}/>})}</button>)}</div>
+        <div className="game-hud"><div><small>SCORE</small><b>{score.toString().padStart(7,"0")}</b></div><div className="now-playing"><i/><span>{track.name}<small>{track.bpm} BPM · {signalMode.toUpperCase()} · {formulaHz} Hz · n {nValue}{modifiers.auto?" · AUTOBOT":""}</small></span></div><div className="hp"><small>SYNC</small><span><i style={{width:`${health}%`}}/></span></div></div>
+        <div className="highway"><div className="hit-guide"><span>HIT ZONE</span><small>PERFECT ±{Math.round(TIMING_WINDOWS[difficulty-1].perfect*1000)} ms</small></div>{LANES.map((key,lane)=><button key={key} onPointerDown={e=>{e.currentTarget.setPointerCapture(e.pointerId);pressLane(lane)}} onPointerUp={()=>releaseLane(lane)} onPointerCancel={()=>releaseLane(lane)} className={`lane ${pressedLanes[lane]?"pressed":""}`}><span className="rail"/><b>{key}</b>{notes.filter(n=>n.lane===lane).map(n=>{const travel=1-(n.hitAt-timeline)/1.6;const p=clamp(travel,-.15,1+n.duration/1.6+.2);const hiddenOpacity=modifiers.hidden?clamp((.78-travel)/.3,0,1):undefined;return <i key={n.id} className={`note ${n.kind} ${n.pressed?"holding":""} ${n.hit?"hit":""} ${n.missed?"missed":""}`} style={{top:`${p*JUDGE_POSITION}%`,height:n.kind==="hold"?`${Math.max(10,n.duration/1.6*JUDGE_POSITION)}%`:undefined,opacity:hiddenOpacity}}/>})}</button>)}</div>
         <div className={`judgement ${lastJudgement.toLowerCase()}`}>{lastJudgement}<small>{timingMs!==null?`${timingMs>0?"+":""}${timingMs} ms`:combo>1?`${combo}× COMBO`:""}</small></div>
         <button className="exit" onClick={()=>{stopAudio();setGame("setup")}}>ESC · ABORT</button>
+        {game === "results" && <div className="retry-overlay"><div className="failure-mark"><i/><i/><i/></div><p>SIGNAL TERMINATED</p><h2>DESYNCHRONIZED</h2><div className="result-readout"><span><small>FINAL SCORE</small><b>{score.toString().padStart(7,"0")}</b></span><span><small>DIFFICULTY</small><b>{["FLOW","PULSE","OVERDRIVE"][difficulty-1]}</b></span><span><small>RUN STATUS</small><b>{modifiers.auto?"AUTOBOT · UNRANKED":"FAILED"}</b></span></div><button className="retry-primary" onClick={launch}>RETRY SIGNAL <b>↻</b></button><button className="retry-secondary" onClick={()=>{setHealth(100);setNotes([]);setGame("setup")}}>RETURN TO SETUP</button></div>}
       </section>}
     </main>
   );
