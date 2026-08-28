@@ -73,7 +73,7 @@ function compileFormula(source: string, mode?: SignalMode) {
   const compileProgram = () => {
     const renderer = new Function("M", `${prelude}${cleaned}`)(Math);
     if (typeof renderer !== "function") throw new Error("FUNCBEAT MUST RETURN FUNCTION(TIME)");
-    return ((t: number, sr: number, n: number) => renderer(t / sr, n, sr)) as (t: number, sr: number, n: number) => FormulaSample;
+    return ((t: number, sr: number, n: number) => renderer(t / sr, sr, n)) as (t: number, sr: number, n: number) => FormulaSample;
   };
   if (mode === "funcbeat") return compileProgram();
   try { return new Function("M", `${prelude}return function(t,sr,n){ return (${cleaned}); };`)(Math) as (t: number, sr: number, n: number) => FormulaSample; }
@@ -159,22 +159,24 @@ export default function Home() {
     const n = override?.n ?? nValue;
     const outputVolume = override?.volume ?? volume;
     let fn: ReturnType<typeof compileFormula>;
-    try { fn = compileFormula(source,mode); let testSample: FormulaSample=0; for (let i = 0; i < 32; i++) testSample=evaluateFormula(fn,i * 257,hz,n,testSample); }
+    try { fn = compileFormula(source,mode); let testSample: FormulaSample=0; for (let i = 0; i < 32; i++) testSample=evaluateFormula(fn,i * 257,hz,n,testSample); if(mode==="funcbeat")fn=compileFormula(source,mode); }
     catch { setStatus("FORMULA ERROR"); return false; }
-    const ctx = new AudioContext({ latencyHint: "interactive" });
+    const contextOptions: AudioContextOptions = { latencyHint: "interactive" };
+    if(mode==="funcbeat")contextOptions.sampleRate=clamp(Math.round(hz),8000,96000);
+    const ctx = new AudioContext(contextOptions);
     try { await ctx.resume(); } catch { setStatus("CLICK PREVIEW TO ENABLE AUDIO"); return false; }
     const processor = ctx.createScriptProcessor(1024, 0, 2);
     const gain = ctx.createGain();
-    const filter = ctx.createBiquadFilter(); filter.type="lowpass"; filter.frequency.value=20000; filter.Q.value=.4;
+    const filter = ctx.createBiquadFilter(); filter.type="lowpass"; filter.frequency.value=Math.min(22000,ctx.sampleRate*.49); filter.Q.value=Math.SQRT1_2;
     const delay = ctx.createDelay(3);
     delay.delayTime.value = kind === "game" ? 1.6 : 0;
     gain.gain.value = clamp(outputVolume / 100, 0, 1.5) * (kind === "preview" ? .22 : 1);
     playbackSpeedRef.current=1;
     let tick = 0; let lastFormulaTick = -1; let cachedResult: FormulaSample = 0; let runtimeFailed = false;
-    let renderStride=mode==="funcbeat"?2:1;let callbackLoad=0;
+    let renderStride=1;let callbackLoad=0;
     let previousMono = 0; let previousEnergy = 0; let previousPeak = 0; let adaptiveFlux = .025; let adaptiveEnergy = 0; let lastOnsetAt = -10; let lastMelodyAt = -10; let eventIndex = 0;
     let smoothedPitch = 60; let lastStablePitch = 60;
-    const analysisMono = new Float32Array(1024);
+    const analysisMono = new Float32Array(processor.bufferSize);
     processor.onaudioprocess = (event) => {
       const callbackStarted=performance.now();
       const left = event.outputBuffer.getChannelData(0);
@@ -248,7 +250,7 @@ export default function Home() {
         }
       }
       const callbackBudget=left.length/ctx.sampleRate*1000;callbackLoad=callbackLoad*.88+(performance.now()-callbackStarted)/callbackBudget*.12;
-      if(hz>=ctx.sampleRate*.75){if(callbackLoad>.82)renderStride=mode==="funcbeat"?8:4;else if(callbackLoad>.58)renderStride=mode==="funcbeat"?4:2;else if(callbackLoad<.32)renderStride=mode==="funcbeat"?2:1}
+      if(mode!=="funcbeat"&&hz>=ctx.sampleRate*.75){if(callbackLoad>.82)renderStride=4;else if(callbackLoad>.58)renderStride=2;else if(callbackLoad<.32)renderStride=1}
       previousEnergy = blockEnergy; previousPeak = peak;
     };
     processor.connect(delay); delay.connect(filter); filter.connect(gain); gain.connect(ctx.destination);
@@ -514,7 +516,7 @@ export default function Home() {
           <button className="preview-button" onClick={()=>audioRef.current?.kind === "preview" ? stopAudio() : void startAudio("preview")}>{audioRef.current?.kind === "preview" ? "■ STOP PREVIEW" : "▶ QUIET PREVIEW"}</button>
           <button className="launch" onClick={launch}><span>INITIALIZE RUN</span><b>↗</b></button><p className="hint">KEYS&nbsp; D · F · J · K &nbsp;/&nbsp; TOUCH</p>
         </div>
-        <details className="formula-panel"><summary><span>03</span><b>FORMULA SOURCE</b><small>EDIT / PASTE BYTEBEAT</small></summary><textarea spellCheck={false} value={formula} onChange={e=>{const value=e.target.value;setFormula(value);setStatus("COMPILING PREVIEW");schedulePreview(value)}}/><div className="mode-help"><b>{signalMode.toUpperCase()}</b><span>{signalMode === "bytebeat" ? "0…255 → преобразуется в −1…1" : signalMode === "signed" ? "−128…127 → преобразуется в −1…1" : signalMode === "funcbeat" ? "JS-программа должна вернуть function(time), где time — секунды" : "готовый сигнал −1…1 без 8-битного преобразования"}</span></div><div className="editor-foot"><span>{signalMode==="funcbeat"?"PROGRAM → FUNCTION(TIME) · ADAPTIVE RENDER":"JS EXPRESSION · t, sr, n AVAILABLE · DEBUG THROW SAFE"}</span><button onClick={()=>void startAudio("preview")}>CHECK + PREVIEW</button></div></details>
+        <details className="formula-panel"><summary><span>03</span><b>FORMULA SOURCE</b><small>EDIT / PASTE BYTEBEAT</small></summary><textarea spellCheck={false} value={formula} onChange={e=>{const value=e.target.value;setFormula(value);setStatus("COMPILING PREVIEW");schedulePreview(value)}}/><div className="mode-help"><b>{signalMode.toUpperCase()}</b><span>{signalMode === "bytebeat" ? "0…255 → преобразуется в −1…1" : signalMode === "signed" ? "−128…127 → преобразуется в −1…1" : signalMode === "funcbeat" ? "JS-программа должна вернуть function(time, sampleRate, n), time — секунды" : "готовый сигнал −1…1 без 8-битного преобразования"}</span></div><div className="editor-foot"><span>{signalMode==="funcbeat"?"STATEFUL PROGRAM · NATIVE SAMPLE RATE · FULL STEREO":"JS EXPRESSION · t, sr, n AVAILABLE · DEBUG THROW SAFE"}</span><button onClick={()=>void startAudio("preview")}>CHECK + PREVIEW</button></div></details>
       </section>}
 
       {game !== "setup" && <section className={`game-shell ${game} ${modifiers.hidden?"hidden-mod":""}`}>
