@@ -4,7 +4,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type SignalMode = "bytebeat" | "signed" | "floatbeat";
 type Track = { name: string; author: string; bpm: number; color: string; formula: string; blurb: string; mode: SignalMode; hz: number; n: number; volume: number };
-type Note = { id: number; lane: number; born: number; hitAt: number; hit?: boolean; missed?: boolean };
+type Note = { id: number; lane: number; born: number; hitAt: number; kind: "tap" | "hold"; duration: number; pressed?: boolean; hit?: boolean; missed?: boolean };
+type Particle = { x: number; y: number; vx: number; vy: number; life: number; size: number };
 
 const TRACKS: Track[] = [
   {
@@ -60,6 +61,7 @@ export default function Home() {
   const [audioOn, setAudioOn] = useState(false);
   const [notes, setNotes] = useState<Note[]>([]);
   const [lastJudgement, setLastJudgement] = useState("");
+  const [pressedLanes, setPressedLanes] = useState<boolean[]>([false,false,false,false]);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const audioRef = useRef<{ ctx: AudioContext; processor: ScriptProcessorNode; gain: GainNode; kind: "preview" | "game" } | null>(null);
   const previewTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -69,6 +71,7 @@ export default function Home() {
   const nextBeatRef = useRef(0);
   const rafRef = useRef(0);
   const spectrumRef = useRef({ energy: 0, peak: 0, wave: new Float32Array(128) });
+  const particlesRef = useRef<Particle[]>([]);
   const track = TRACKS[trackIndex];
 
   const stopAudio = useCallback(() => {
@@ -133,31 +136,56 @@ export default function Home() {
 
   const launch = async () => {
     const ok = await startAudio("game"); if (!ok) return;
-    notesRef.current = []; setNotes([]); setScore(0); setCombo(0); setHealth(100);
+    notesRef.current = []; particlesRef.current = []; setNotes([]); setScore(0); setCombo(0); setHealth(100); setPressedLanes([false,false,false,false]);
     startRef.current = performance.now(); nextBeatRef.current = 1.6; idRef.current = 1;
     setGame("running"); setLastJudgement("SYNC");
   };
 
-  const judge = useCallback((lane: number) => {
+  const burst = useCallback((lane: number, amount = 16) => {
+    const w = window.innerWidth; const h = window.innerHeight - 70;
+    const road = Math.min(620, w * .75); const x = w / 2 - road / 2 + road * (lane + .5) / 4;
+    for (let i=0;i<amount;i++) particlesRef.current.push({x,y:h*.82,vx:(Math.random()-.5)*7,vy:-2-Math.random()*7,life:1,size:2+Math.random()*6});
+  }, []);
+
+  const pressLane = useCallback((lane: number) => {
     if (game !== "running") return;
+    setPressedLanes(v => v.map((pressed,i)=>i===lane?true:pressed));
     const now = (performance.now() - startRef.current) / 1000;
     let best: Note | undefined; let delta = Infinity;
     for (const note of notesRef.current) {
-      if (note.lane !== lane || note.hit || note.missed) continue;
+      if (note.lane !== lane || note.hit || note.missed || note.pressed) continue;
       const d = Math.abs(note.hitAt - now); if (d < delta) { delta = d; best = note; }
     }
     if (!best || delta > .22) { setCombo(0); setLastJudgement("MISS"); setHealth(v => clamp(v - 4, 0, 100)); return; }
-    best.hit = true;
     const label = delta < .065 ? "PERFECT" : delta < .13 ? "GREAT" : "GOOD";
     const pts = label === "PERFECT" ? 1000 : label === "GREAT" ? 650 : 350;
-    setCombo(v => v + 1); setScore(v => v + pts); setHealth(v => clamp(v + 1.2, 0, 100)); setLastJudgement(label);
+    if (best.kind === "hold") { best.pressed = true; setLastJudgement("HOLD"); }
+    else { best.hit = true; setLastJudgement(label); }
+    setCombo(v => v + 1); setScore(v => v + pts); setHealth(v => clamp(v + 1.2, 0, 100));
+    burst(lane, best.kind === "hold" ? 10 : 18);
     setNotes([...notesRef.current]);
-  }, [game]);
+  }, [burst, game]);
+
+  const releaseLane = useCallback((lane: number) => {
+    setPressedLanes(v => v.map((pressed,i)=>i===lane?false:pressed));
+    if (game !== "running") return;
+    const now = (performance.now() - startRef.current) / 1000;
+    const hold = notesRef.current.find(note => note.lane===lane && note.kind==="hold" && note.pressed && !note.hit && !note.missed);
+    if (!hold) return;
+    hold.pressed = false;
+    if (now >= hold.hitAt + hold.duration - .16) {
+      hold.hit = true; setScore(v=>v+Math.round(1200+hold.duration*900)); setCombo(v=>v+1); setLastJudgement("RELEASE"); setHealth(v=>clamp(v+3,0,100)); burst(lane,28);
+    } else {
+      hold.missed = true; setCombo(0); setLastJudgement("EARLY"); setHealth(v=>clamp(v-10,0,100));
+    }
+    setNotes([...notesRef.current]);
+  }, [burst, game]);
 
   useEffect(() => {
-    const key = (e: KeyboardEvent) => { const i = LANES.indexOf(e.key.toUpperCase()); if (i >= 0) judge(i); if (e.key === "Escape" && game === "running") { stopAudio(); setGame("setup"); } };
-    window.addEventListener("keydown", key); return () => window.removeEventListener("keydown", key);
-  }, [judge, game, stopAudio]);
+    const down = (e: KeyboardEvent) => { const i = LANES.indexOf(e.key.toUpperCase()); if (i >= 0 && !e.repeat) pressLane(i); if (e.key === "Escape" && game === "running") { stopAudio(); setGame("setup"); } };
+    const up = (e: KeyboardEvent) => { const i = LANES.indexOf(e.key.toUpperCase()); if (i >= 0) releaseLane(i); };
+    window.addEventListener("keydown", down); window.addEventListener("keyup", up); return () => { window.removeEventListener("keydown", down); window.removeEventListener("keyup", up); };
+  }, [pressLane, releaseLane, game, stopAudio]);
 
   useEffect(() => {
     if (game !== "running") return;
@@ -172,40 +200,54 @@ export default function Home() {
         const step = Math.round(nextBeatRef.current / subdivision);
         if (pulse > threshold || step % Math.max(1, 4 - difficulty) === 0) {
           const lane = Math.abs(Math.floor((Math.sin(step * 12.9898 + trackIndex * 7) * 43758.5453))) % 4;
-          notesRef.current.push({ id: idRef.current++, lane, born: now, hitAt: nextBeatRef.current });
-          if (difficulty === 3 && step % 7 === 0) notesRef.current.push({ id: idRef.current++, lane: (lane + 2) % 4, born: now, hitAt: nextBeatRef.current });
+          const isHold = step > 2 && step % (difficulty === 1 ? 10 : 6) === 2;
+          const duration = isHold ? beat * (difficulty === 3 && step % 12 === 2 ? 3 : 1.75) : 0;
+          notesRef.current.push({ id: idRef.current++, lane, born: now, hitAt: nextBeatRef.current, kind: isHold ? "hold" : "tap", duration });
+          if (difficulty === 3 && step % 7 === 0 && !isHold) notesRef.current.push({ id: idRef.current++, lane: (lane + 2) % 4, born: now, hitAt: nextBeatRef.current, kind: "tap", duration: 0 });
         }
         nextBeatRef.current += subdivision;
       }
       for (const note of notesRef.current) {
-        if (!note.hit && !note.missed && now - note.hitAt > .24) {
+        if (note.kind === "hold" && note.pressed && !note.hit && !note.missed && now >= note.hitAt + note.duration) {
+          note.pressed = false; note.hit = true; setScore(v=>v+Math.round(1200+note.duration*900)); setCombo(v=>v+1); setLastJudgement("HELD"); setHealth(v=>clamp(v+3,0,100)); burst(note.lane,28);
+        } else if (!note.hit && !note.missed && !note.pressed && now - note.hitAt > .24) {
           note.missed = true; setCombo(0); setHealth(v => clamp(v - 7, 0, 100)); setLastJudgement("MISS");
         }
       }
-      notesRef.current = notesRef.current.filter(n => now - n.hitAt < .65);
+      notesRef.current = notesRef.current.filter(n => now - (n.hitAt + n.duration) < .75);
       setNotes([...notesRef.current]);
       rafRef.current = requestAnimationFrame(loop);
     };
     rafRef.current = requestAnimationFrame(loop); return () => cancelAnimationFrame(rafRef.current);
-  }, [game, difficulty, sensitivity, track.bpm, trackIndex]);
+  }, [game, difficulty, sensitivity, track.bpm, trackIndex, burst]);
 
   useEffect(() => {
     const canvas = canvasRef.current; if (!canvas) return;
     const ctx = canvas.getContext("2d"); if (!ctx) return;
-    let frame = 0;
+    let frame = 0; let animationId = 0;
     const draw = () => {
       const rect = canvas.getBoundingClientRect(); const dpr = Math.min(devicePixelRatio, 2);
       if (canvas.width !== rect.width * dpr || canvas.height !== rect.height * dpr) { canvas.width = rect.width * dpr; canvas.height = rect.height * dpr; }
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0); const w = rect.width, h = rect.height;
-      ctx.fillStyle = "#080808"; ctx.fillRect(0, 0, w, h);
-      const grad = ctx.createRadialGradient(w*.5,h*.55,0,w*.5,h*.55,w*.65); grad.addColorStop(0, track.color+"24"); grad.addColorStop(1,"transparent"); ctx.fillStyle=grad; ctx.fillRect(0,0,w,h);
-      const wave = spectrumRef.current.wave; ctx.beginPath();
-      for (let i=0;i<wave.length;i++){ const x=i/(wave.length-1)*w; const y=h*.5+wave[i]*h*.23; i?ctx.lineTo(x,y):ctx.moveTo(x,y); }
-      ctx.strokeStyle=track.color; ctx.lineWidth=2; ctx.shadowBlur=18; ctx.shadowColor=track.color; ctx.stroke(); ctx.shadowBlur=0;
-      for(let ring=0;ring<4;ring++){ const r=((frame*1.4+ring*80)%(Math.min(w,h)*.55)); ctx.beginPath(); ctx.arc(w/2,h/2,r,0,Math.PI*2); ctx.strokeStyle=track.color+Math.floor(90*(1-r/(Math.min(w,h)*.55))).toString(16).padStart(2,"0"); ctx.lineWidth=1; ctx.stroke(); }
-      frame++; requestAnimationFrame(draw);
-    }; const id=requestAnimationFrame(draw); return()=>cancelAnimationFrame(id);
-  }, [track.color]);
+      ctx.fillStyle = "#050605"; ctx.fillRect(0, 0, w, h);
+      const signal = spectrumRef.current; const wave = signal.wave; const energy = signal.energy;
+      const grad = ctx.createRadialGradient(w*.5,h*(game==="running"?.68:.55),0,w*.5,h*.55,w*.72); grad.addColorStop(0,track.color+(game==="running"?"35":"20")); grad.addColorStop(.46,track.color+"0d"); grad.addColorStop(1,"transparent"); ctx.fillStyle=grad; ctx.fillRect(0,0,w,h);
+      if(game==="running"){
+        ctx.save(); ctx.strokeStyle=track.color; ctx.globalAlpha=.08+energy*.12; ctx.lineWidth=1;
+        for(let i=-9;i<=9;i++){ctx.beginPath();ctx.moveTo(w/2,h*.35);ctx.lineTo(w/2+i*w*.085,h);ctx.stroke()}
+        for(let i=0;i<8;i++){const y=h*.38+Math.pow(i/7,1.7)*h*.62;ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke()} ctx.restore();
+      }
+      ctx.save(); ctx.globalCompositeOperation="lighter";
+      const bars=48; for(let i=0;i<bars;i++){const amp=Math.abs(wave[(i*2)%wave.length]);const bh=(.015+amp*.75+energy*.18)*h*(game==="running"?.34:.22);const x=i/(bars-1)*w;ctx.globalAlpha=.1+amp*.55;ctx.fillStyle=track.color;ctx.fillRect(x-w/bars*.28,h*.54-bh/2,w/bars*.56,bh)}
+      for(let layer=0;layer<3;layer++){ctx.beginPath();for(let i=0;i<wave.length;i++){const x=i/(wave.length-1)*w;const y=h*.54+wave[i]*h*(.10+layer*.055);i?ctx.lineTo(x,y):ctx.moveTo(x,y)}ctx.globalAlpha=.55-layer*.15;ctx.strokeStyle=track.color;ctx.lineWidth=layer===0?2:1;ctx.shadowBlur=20;ctx.shadowColor=track.color;ctx.stroke()}
+      ctx.shadowBlur=0; for(let ring=0;ring<6;ring++){const limit=Math.min(w,h)*.7;const r=(frame*(1.1+energy*3)+ring*limit/6)%limit;ctx.beginPath();ctx.arc(w/2,h*.54,r,0,Math.PI*2);ctx.globalAlpha=(1-r/limit)*(.22+energy*.28);ctx.strokeStyle=track.color;ctx.lineWidth=1+energy*2;ctx.stroke()}
+      if(game==="running"){
+        particlesRef.current=particlesRef.current.filter(p=>p.life>0);
+        for(const p of particlesRef.current){p.x+=p.vx;p.y+=p.vy;p.vy+=.14;p.life-=.025;ctx.globalAlpha=p.life;ctx.fillStyle=track.color;ctx.shadowBlur=12;ctx.shadowColor=track.color;ctx.fillRect(p.x,p.y,p.size,p.size)}
+      }
+      ctx.restore(); frame++; animationId=requestAnimationFrame(draw);
+    }; animationId=requestAnimationFrame(draw); return()=>cancelAnimationFrame(animationId);
+  }, [game, track.color]);
 
   useEffect(() => () => stopAudio(), [stopAudio]);
 
@@ -241,7 +283,7 @@ export default function Home() {
       {game === "running" && <section className="game-shell">
         <canvas ref={canvasRef} className="game-bg"/>
         <div className="game-hud"><div><small>SCORE</small><b>{score.toString().padStart(7,"0")}</b></div><div className="now-playing"><i/><span>{track.name}<small>{track.bpm} BPM · {signalMode.toUpperCase()} · {formulaHz} Hz · n {nValue}</small></span></div><div className="hp"><small>SYNC</small><span><i style={{width:`${health}%`}}/></span></div></div>
-        <div className="highway">{LANES.map((key,lane)=><button key={key} onPointerDown={()=>judge(lane)} className="lane"><span className="rail"/><b>{key}</b>{notes.filter(n=>n.lane===lane).map(n=>{const p=clamp(1-(n.hitAt-timeline)/1.6,0,1);return <i key={n.id} className={`note ${n.hit?"hit":""} ${n.missed?"missed":""}`} style={{top:`${p*82}%`}}/>})}</button>)}</div>
+        <div className="highway">{LANES.map((key,lane)=><button key={key} onPointerDown={e=>{e.currentTarget.setPointerCapture(e.pointerId);pressLane(lane)}} onPointerUp={()=>releaseLane(lane)} onPointerCancel={()=>releaseLane(lane)} className={`lane ${pressedLanes[lane]?"pressed":""}`}><span className="rail"/><b>{key}</b>{notes.filter(n=>n.lane===lane).map(n=>{const travel=1-(n.hitAt-timeline)/1.6;const p=clamp(travel,-.15,1+n.duration/1.6+.2);return <i key={n.id} className={`note ${n.kind} ${n.pressed?"holding":""} ${n.hit?"hit":""} ${n.missed?"missed":""}`} style={{top:`${p*82}%`,height:n.kind==="hold"?`${Math.max(10,n.duration/1.6*82)}%`:undefined}}/>})}</button>)}</div>
         <div className={`judgement ${lastJudgement.toLowerCase()}`}>{lastJudgement}<small>{combo>1?`${combo}× COMBO`:""}</small></div>
         <button className="exit" onClick={()=>{stopAudio();setGame("setup")}}>ESC · ABORT</button>
       </section>}
