@@ -2,24 +2,25 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-type Track = { name: string; author: string; bpm: number; color: string; formula: string; blurb: string };
+type SignalMode = "bytebeat" | "signed" | "floatbeat";
+type Track = { name: string; author: string; bpm: number; color: string; formula: string; blurb: string; mode: SignalMode; hz: number; n: number; volume: number };
 type Note = { id: number; lane: number; born: number; hitAt: number; hit?: boolean; missed?: boolean };
 
 const TRACKS: Track[] = [
   {
     name: "NEON REVERB", author: "formula 01", bpm: 138, color: "#dfff00",
-    blurb: "Glass arpeggio / elastic echoes",
-    formula: "tanh((((t*1.7*2**(([2,-2,0,5,4][(t>>13)%5])/12))&255)/127-1)*.72 + sin(t/31)*.12 + sin(t/997)*.18) * (1.1+.5*sin(t/16384)))",
+    blurb: "Glass arpeggio / elastic echoes", mode: "floatbeat", hz: 48000, n: 1, volume: 74,
+    formula: "tanh(sin(t*2*PI*(110*n*2**([0,3,7,10][floor(t*4/sr)%4]/12))/sr)*(.34+.18*pow(1-t%(sr/4)/(sr/4),3)) + sin(2*PI*55*n*t/sr)*pow(1-t%(sr/2)/(sr/2),5)*.85 + (random()-.5)*pow(1-t%(sr/8)/(sr/8),9)*.16)",
   },
   {
     name: "BASE 36", author: "formula 02", bpm: 112, color: "#ff4fd8",
-    blurb: "Bitcrushed melody / slow pulse",
-    formula: "((((t*2**(parseInt('C7C5C32A23AFEA5A23AFHEACEA5C73A2'[(t>>13)%32],36)/12)*1.7)&255)-128)/128)*(1-t%8192/12000) + ((((t*2**(parseInt('KMJOKMOOO'[(t>>15)&7],36)/12))>>4)&64)-32)/96)",
+    blurb: "Bitcrushed melody / slow pulse", mode: "bytebeat", hz: 8000, n: 1, volume: 58,
+    formula: "(t*n*2**([0,3,7,10,7,3,12,10][(t>>12)&7]/12) + (t>>4) + (t*(t>>9|t>>13)&63)) & 255",
   },
   {
     name: "CHROME KICK", author: "formula 03", bpm: 150, color: "#61e7ff",
-    blurb: "Sub pressure / fractured hats",
-    formula: "tanh(sin((t*2**('03202222222222270320222222233330'[(t>>13)&31]/12))/75)*.35 + cos(sqrt(t%8192))*pow(1-(t%8192)/8192,3)*1.4 + (random()-.5)*pow(1-(t%4096)/4096,7)*.25)",
+    blurb: "Sub pressure / fractured hats", mode: "floatbeat", hz: 48000, n: 1, volume: 68,
+    formula: "tanh(sin((t*n*2**('03202222222222270320222222233330'[(t>>13)&31]/12))/75)*.35 + cos(sqrt(t%8192))*pow(1-(t%8192)/8192,3)*1.4 + (random()-.5)*pow(1-(t%4096)/4096,7)*.25)",
   },
 ];
 
@@ -28,10 +29,18 @@ const clamp = (n: number, a: number, b: number) => Math.max(a, Math.min(b, n));
 
 function compileFormula(source: string) {
   const cleaned = source.replaceAll("\\*", "*").replaceAll("\\_", "_");
-  return new Function("t", "sr", `
+  return new Function("t", "sr", "n", `
     const {sin,cos,tan,tanh,asin,sqrt,pow,min,max,abs,round,floor,PI,random}=Math;
-    try { const v=(${cleaned}); return Array.isArray(v) ? v : [v,v]; } catch(e) { return [0,0]; }
-  `) as (t: number, sr: number) => number[];
+    const v=(${cleaned}); return Array.isArray(v) ? v : [v,v];
+  `) as (t: number, sr: number, n: number) => number[];
+}
+
+function normalizeSample(value: number, mode: SignalMode) {
+  if (!Number.isFinite(value)) return 0;
+  if (mode === "floatbeat") return clamp(value, -1, 1);
+  const integer = Math.floor(value);
+  if (mode === "bytebeat") return ((integer & 255) - 128) / 128;
+  return (((integer + 128) & 255) - 128) / 128;
 }
 
 export default function Home() {
@@ -39,6 +48,10 @@ export default function Home() {
   const [formula, setFormula] = useState(TRACKS[0].formula);
   const [difficulty, setDifficulty] = useState(2);
   const [sensitivity, setSensitivity] = useState(62);
+  const [signalMode, setSignalMode] = useState<SignalMode>(TRACKS[0].mode);
+  const [formulaHz, setFormulaHz] = useState(TRACKS[0].hz);
+  const [nValue, setNValue] = useState(TRACKS[0].n);
+  const [volume, setVolume] = useState(TRACKS[0].volume);
   const [game, setGame] = useState<"setup" | "running" | "results">("setup");
   const [score, setScore] = useState(0);
   const [combo, setCombo] = useState(0);
@@ -48,7 +61,8 @@ export default function Home() {
   const [notes, setNotes] = useState<Note[]>([]);
   const [lastJudgement, setLastJudgement] = useState("");
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const audioRef = useRef<{ ctx: AudioContext; processor: ScriptProcessorNode; gain: GainNode } | null>(null);
+  const audioRef = useRef<{ ctx: AudioContext; processor: ScriptProcessorNode; gain: GainNode; kind: "preview" | "game" } | null>(null);
+  const previewTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const notesRef = useRef<Note[]>([]);
   const startRef = useRef(0);
   const idRef = useRef(1);
@@ -64,51 +78,61 @@ export default function Home() {
     setAudioOn(false);
   }, []);
 
-  const startAudio = useCallback(async () => {
+  const startAudio = useCallback(async (kind: "preview" | "game" = "game", override?: Partial<{ formula: string; mode: SignalMode; hz: number; n: number; volume: number }>) => {
     stopAudio();
+    const source = override?.formula ?? formula;
+    const mode = override?.mode ?? signalMode;
+    const hz = override?.hz ?? formulaHz;
+    const n = override?.n ?? nValue;
+    const outputVolume = override?.volume ?? volume;
     let fn: ReturnType<typeof compileFormula>;
-    try { fn = compileFormula(formula); fn(1, 48000); }
+    try { fn = compileFormula(source); for (let i = 0; i < 32; i++) fn(i * 257, hz, n); }
     catch { setStatus("FORMULA ERROR"); return false; }
     const ctx = new AudioContext({ latencyHint: "interactive" });
-    await ctx.resume();
+    try { await ctx.resume(); } catch { setStatus("CLICK PREVIEW TO ENABLE AUDIO"); return false; }
     const processor = ctx.createScriptProcessor(1024, 0, 2);
     const gain = ctx.createGain();
     const delay = ctx.createDelay(3);
-    delay.delayTime.value = 1.6;
-    gain.gain.value = .72;
+    delay.delayTime.value = kind === "game" ? 1.6 : 0;
+    gain.gain.value = clamp(outputVolume / 100, 0, 1.5) * (kind === "preview" ? .22 : 1);
     let tick = 0;
     processor.onaudioprocess = (event) => {
       const left = event.outputBuffer.getChannelData(0);
       const right = event.outputBuffer.getChannelData(1);
       let energy = 0; let peak = 0;
-      for (let i = 0; i < left.length; i++, tick++) {
-        const result = fn(tick, ctx.sampleRate);
-        let l = Number(result?.[0] ?? 0); let r = Number(result?.[1] ?? l);
-        if (Math.abs(l) > 2) l = (l - 128) / 128;
-        if (Math.abs(r) > 2) r = (r - 128) / 128;
-        l = clamp(Number.isFinite(l) ? l : 0, -1, 1);
-        r = clamp(Number.isFinite(r) ? r : 0, -1, 1);
-        left[i] = l; right[i] = r;
-        const amp = (Math.abs(l) + Math.abs(r)) / 2;
-        energy += amp; peak = Math.max(peak, amp);
-        if (i % 8 === 0) spectrumRef.current.wave[(i / 8) % 128] = (l + r) / 2;
-      }
+      try {
+        for (let i = 0; i < left.length; i++) {
+          const result = fn(tick, hz, n); tick += hz / ctx.sampleRate;
+          const l = normalizeSample(Number(result?.[0] ?? 0), mode);
+          const r = normalizeSample(Number(result?.[1] ?? l), mode);
+          left[i] = l; right[i] = r;
+          const amp = (Math.abs(l) + Math.abs(r)) / 2;
+          energy += amp; peak = Math.max(peak, amp);
+          if (i % 8 === 0) spectrumRef.current.wave[(i / 8) % 128] = (l + r) / 2;
+        }
+      } catch { left.fill(0); right.fill(0); }
       spectrumRef.current.energy = energy / left.length;
       spectrumRef.current.peak = peak;
     };
     processor.connect(delay); delay.connect(gain); gain.connect(ctx.destination);
-    audioRef.current = { ctx, processor, gain };
-    setAudioOn(true); setStatus("SIGNAL LOCKED");
+    audioRef.current = { ctx, processor, gain, kind };
+    setAudioOn(true); setStatus(kind === "preview" ? "QUIET PREVIEW" : "SIGNAL LOCKED");
     return true;
-  }, [formula, stopAudio]);
+  }, [formula, formulaHz, nValue, signalMode, volume, stopAudio]);
 
   const chooseTrack = (i: number) => {
-    setTrackIndex(i); setFormula(TRACKS[i].formula); setStatus("FORMULA READY");
-    if (audioOn) stopAudio();
+    const selected = TRACKS[i];
+    setTrackIndex(i); setFormula(selected.formula); setSignalMode(selected.mode); setFormulaHz(selected.hz); setNValue(selected.n); setVolume(selected.volume);
+    void startAudio("preview", selected);
+  };
+
+  const schedulePreview = (nextFormula = formula, override?: Partial<{ mode: SignalMode; hz: number; n: number; volume: number }>) => {
+    if (previewTimerRef.current) clearTimeout(previewTimerRef.current);
+    previewTimerRef.current = setTimeout(() => void startAudio("preview", { ...override, formula: nextFormula }), 420);
   };
 
   const launch = async () => {
-    const ok = await startAudio(); if (!ok) return;
+    const ok = await startAudio("game"); if (!ok) return;
     notesRef.current = []; setNotes([]); setScore(0); setCombo(0); setHealth(100);
     startRef.current = performance.now(); nextBeatRef.current = 1.6; idRef.current = 1;
     setGame("running"); setLastJudgement("SYNC");
@@ -195,21 +219,28 @@ export default function Home() {
         <div className="intro"><p className="eyebrow">BYTEBEAT RHYTHM SYSTEM</p><h1>TURN CODE<br/><em>INTO RHYTHM.</em></h1><p className="lead">Каждая формула — одновременно музыка, визуальная система и новая игровая карта.</p></div>
         <div className="track-panel">
           <div className="panel-title"><span>01</span><div><b>SELECT SIGNAL</b><small>3 FORMULAS LOADED</small></div></div>
-          <div className="track-list">{TRACKS.map((item,i)=><button key={item.name} onClick={()=>chooseTrack(i)} className={i===trackIndex?"selected":""}><span className="num">0{i+1}</span><div><b>{item.name}</b><small>{item.blurb}</small></div><span className="bpm">{item.bpm}<small>BPM</small></span></button>)}</div>
+          <div className="track-list">{TRACKS.map((item,i)=><button key={item.name} onClick={()=>chooseTrack(i)} className={i===trackIndex?"selected":""}><span className="num">0{i+1}</span><div><b>{item.name}</b><small>{item.blurb} · {item.mode}</small></div><span className="bpm">{item.bpm}<small>BPM</small></span></button>)}</div>
         </div>
         <div className="visual-card"><canvas ref={canvasRef}/><div className="visual-label"><span>LIVE SIGNAL</span><b>{track.name}</b></div><div className="reticle">+</div></div>
         <div className="config-panel">
           <div className="panel-title"><span>02</span><div><b>CALIBRATE</b><small>GAMEPLAY RESPONSE</small></div></div>
+          <label>SIGNAL MODE <span>{signalMode.toUpperCase()}</span></label><div className="mode-tabs">{(["bytebeat","signed","floatbeat"] as SignalMode[]).map(mode=><button key={mode} onClick={()=>{setSignalMode(mode);schedulePreview(formula,{mode})}} className={signalMode===mode?"on":""}>{mode === "signed" ? "SIGNED 8-BIT" : mode.toUpperCase()}</button>)}</div>
+          <div className="parameter-grid">
+            <label><span>FORMULA Hz</span><input aria-label="Formula sample rate in hertz" type="number" min="1000" max="96000" step="100" value={formulaHz} onChange={e=>{const hz=clamp(+e.target.value||1000,1000,96000);setFormulaHz(hz);schedulePreview(formula,{hz})}}/></label>
+            <label><span>n VALUE</span><input aria-label="Formula n value" type="number" min="-16" max="16" step="0.05" value={nValue} onChange={e=>{const n=clamp(+e.target.value||0,-16,16);setNValue(n);schedulePreview(formula,{n})}}/></label>
+            <label><span>VOLUME %</span><input aria-label="Volume percent" type="number" min="0" max="150" step="1" value={volume} onChange={e=>{const nextVolume=clamp(+e.target.value||0,0,150);setVolume(nextVolume);schedulePreview(formula,{volume:nextVolume})}}/></label>
+          </div>
           <label>DIFFICULTY <span>{["FLOW","PULSE","OVERDRIVE"][difficulty-1]}</span></label><div className="segments">{[1,2,3].map(n=><button aria-label={`Difficulty ${n}`} onClick={()=>setDifficulty(n)} className={difficulty===n?"on":""} key={n}/>)}</div>
           <label>SIGNAL SENSITIVITY <span>{sensitivity}%</span></label><input type="range" min="30" max="90" value={sensitivity} onChange={e=>setSensitivity(+e.target.value)}/>
+          <button className="preview-button" onClick={()=>audioRef.current?.kind === "preview" ? stopAudio() : void startAudio("preview")}>{audioRef.current?.kind === "preview" ? "■ STOP PREVIEW" : "▶ QUIET PREVIEW"}</button>
           <button className="launch" onClick={launch}><span>INITIALIZE RUN</span><b>↗</b></button><p className="hint">KEYS&nbsp; D · F · J · K &nbsp;/&nbsp; TOUCH</p>
         </div>
-        <details className="formula-panel"><summary><span>03</span><b>FORMULA SOURCE</b><small>EDIT / PASTE BYTEBEAT</small></summary><textarea spellCheck={false} value={formula} onChange={e=>{setFormula(e.target.value);setStatus("UNCOMPILED CHANGES")}}/><div className="editor-foot"><span>JS EXPRESSION · t + sr AVAILABLE</span><button onClick={()=>{try{compileFormula(formula)(1,48000);setStatus("FORMULA READY")}catch{setStatus("FORMULA ERROR")}}}>CHECK CODE</button></div></details>
+        <details className="formula-panel"><summary><span>03</span><b>FORMULA SOURCE</b><small>EDIT / PASTE BYTEBEAT</small></summary><textarea spellCheck={false} value={formula} onChange={e=>{const value=e.target.value;setFormula(value);setStatus("COMPILING PREVIEW");schedulePreview(value)}}/><div className="mode-help"><b>{signalMode.toUpperCase()}</b><span>{signalMode === "bytebeat" ? "0…255 → преобразуется в −1…1" : signalMode === "signed" ? "−128…127 → преобразуется в −1…1" : "готовый сигнал −1…1 без 8-битного преобразования"}</span></div><div className="editor-foot"><span>JS EXPRESSION · t, sr, n AVAILABLE</span><button onClick={()=>{try{const test=compileFormula(formula);for(let i=0;i<32;i++)test(i*257,formulaHz,nValue);setStatus("FORMULA READY");void startAudio("preview")}catch{setStatus("FORMULA ERROR")}}}>CHECK + PREVIEW</button></div></details>
       </section>}
 
       {game === "running" && <section className="game-shell">
         <canvas ref={canvasRef} className="game-bg"/>
-        <div className="game-hud"><div><small>SCORE</small><b>{score.toString().padStart(7,"0")}</b></div><div className="now-playing"><i/><span>{track.name}<small>{track.bpm} BPM · LIVE CHART</small></span></div><div className="hp"><small>SYNC</small><span><i style={{width:`${health}%`}}/></span></div></div>
+        <div className="game-hud"><div><small>SCORE</small><b>{score.toString().padStart(7,"0")}</b></div><div className="now-playing"><i/><span>{track.name}<small>{track.bpm} BPM · {signalMode.toUpperCase()} · {formulaHz} Hz · n {nValue}</small></span></div><div className="hp"><small>SYNC</small><span><i style={{width:`${health}%`}}/></span></div></div>
         <div className="highway">{LANES.map((key,lane)=><button key={key} onPointerDown={()=>judge(lane)} className="lane"><span className="rail"/><b>{key}</b>{notes.filter(n=>n.lane===lane).map(n=>{const p=clamp(1-(n.hitAt-timeline)/1.6,0,1);return <i key={n.id} className={`note ${n.hit?"hit":""} ${n.missed?"missed":""}`} style={{top:`${p*82}%`}}/>})}</button>)}</div>
         <div className={`judgement ${lastJudgement.toLowerCase()}`}>{lastJudgement}<small>{combo>1?`${combo}× COMBO`:""}</small></div>
         <button className="exit" onClick={()=>{stopAudio();setGame("setup")}}>ESC · ABORT</button>
