@@ -126,7 +126,7 @@ export default function Home() {
   const idRef = useRef(1);
   const nextBeatRef = useRef(0);
   const rafRef = useRef(0);
-  const spectrumRef = useRef({ energy: 0, peak: 0, flux: 0, intensity: 0, silence: true, pitch: 0, pitchConfidence: 0, wave: new Float32Array(128) });
+  const spectrumRef = useRef({ energy: 0, peak: 0, flux: 0, onset: 0, intensity: 0, silence: true, pitch: 0, pitchConfidence: 0, wave: new Float32Array(128) });
   const particlesRef = useRef<Particle[]>([]);
   const rhythmEventsRef = useRef<RhythmEvent[]>([]);
   const gameActiveRef = useRef(false);
@@ -169,7 +169,7 @@ export default function Home() {
     playbackSpeedRef.current=1;
     let tick = 0; let lastFormulaTick = -1; let cachedResult: FormulaSample = 0; let runtimeFailed = false;
     let renderStride=mode==="funcbeat"?2:1;let callbackLoad=0;
-    let previousMono = 0; let previousEnergy = 0; let adaptiveFlux = .025; let adaptiveEnergy = 0; let lastOnsetAt = -10; let lastMelodyAt = -10; let eventIndex = 0;
+    let previousMono = 0; let previousEnergy = 0; let previousPeak = 0; let adaptiveFlux = .025; let adaptiveEnergy = 0; let lastOnsetAt = -10; let lastMelodyAt = -10; let eventIndex = 0;
     let smoothedPitch = 60; let lastStablePitch = 60;
     const analysisMono = new Float32Array(1024);
     processor.onaudioprocess = (event) => {
@@ -198,24 +198,32 @@ export default function Home() {
       const blockEnergy = energy / left.length; const blockFlux = flux / left.length;
       adaptiveFlux = adaptiveFlux * .965 + blockFlux * .035;
       adaptiveEnergy = adaptiveEnergy ? adaptiveEnergy * .998 + blockEnergy * .002 : Math.max(.025, blockEnergy);
-      const onsetScore = Math.max(0, blockEnergy - previousEnergy * .9) + Math.max(0, blockFlux - adaptiveFlux) * .85;
+      const onsetScore = Math.max(0, blockEnergy - previousEnergy) * 1.65 + Math.max(0, peak - previousPeak) * .22 + Math.max(0, blockFlux - adaptiveFlux) * .85;
       const relativeEnergy = blockEnergy / Math.max(.025, adaptiveEnergy);
       const rawIntensity = clamp((relativeEnergy - .55) * .62 + onsetScore * 3.2 + peak * .14, 0, 1);
       const pitch = kind === "game" ? detectPitch(analysisMono, ctx.sampleRate) : { midi: 0, confidence: 0 };
       spectrumRef.current.energy = blockEnergy;
       spectrumRef.current.peak = peak;
       spectrumRef.current.flux = blockFlux;
+      spectrumRef.current.onset = Math.max(onsetScore, spectrumRef.current.onset * .72);
       spectrumRef.current.intensity = spectrumRef.current.intensity * .86 + rawIntensity * .14;
       spectrumRef.current.silence = blockEnergy < .025 && peak < .075;
       spectrumRef.current.pitch = pitch.midi;
       spectrumRef.current.pitchConfidence = pitch.confidence;
       const beat = 60 / track.bpm;
-      const onsetCooldown = difficulty === 1 ? beat * .7 : difficulty === 2 ? beat * .42 : beat * .22;
-      if (kind === "game" && gameActiveRef.current && ctx.currentTime - lastOnsetAt > onsetCooldown && onsetScore > .028 + adaptiveFlux * .52) {
+      const sectionIntensity = spectrumRef.current.intensity;
+      const relaxedCooldown = difficulty === 1 ? .9 : difficulty === 2 ? .58 : .34;
+      const intenseCooldown = difficulty === 1 ? .46 : difficulty === 2 ? .24 : .11;
+      const onsetCooldown = beat * (relaxedCooldown - (relaxedCooldown-intenseCooldown) * sectionIntensity);
+      const sensitivityScale = clamp((115-sensitivity)/55,.45,1.55);
+      const onsetThreshold = (.018 + adaptiveFlux * .42) * sensitivityScale;
+      const pitchGate = mode === "bytebeat" || mode === "signed" ? .72 : mode === "funcbeat" ? .64 : .58;
+      if (kind === "game" && gameActiveRef.current && ctx.currentTime - lastOnsetAt > onsetCooldown && onsetScore > onsetThreshold) {
         const relativeNow = (performance.now() - startRef.current) / 1000;
         const strength = clamp(onsetScore * 5 + peak * .35, 0, 1);
-        const patterns = difficulty === 1 ? [0,1,2,3,2,1] : difficulty === 2 ? [0,1,3,2,1,2,0,3] : [0,3,1,2,2,1,3,0];
-        const lane = patterns[eventIndex % patterns.length];
+        const patterns = difficulty === 1 ? [0,0,2,1,1,3,2,2] : difficulty === 2 ? [0,0,1,3,3,2,2,1,0,2] : [0,0,3,1,1,2,2,3,0,3,3,1];
+        const tonalLane = clamp(Math.round(1.5 + (pitch.midi - smoothedPitch) / 2.5), 0, 3);
+        const lane = pitch.confidence > pitchGate ? tonalLane : patterns[eventIndex % patterns.length];
         const stableTone = blockEnergy > .27 && blockFlux < Math.max(.22, adaptiveFlux * 1.45);
         const holdEvery = difficulty === 1 ? 12 : difficulty === 2 ? 10 : 7;
         const hold = stableTone && eventIndex > 0 && eventIndex % holdEvery === 0;
@@ -223,12 +231,11 @@ export default function Home() {
         if (rhythmEventsRef.current.length > 32) rhythmEventsRef.current.shift();
         lastOnsetAt = ctx.currentTime; eventIndex++;
       }
-      const pitchGate = mode === "bytebeat" || mode === "signed" ? .72 : mode === "funcbeat" ? .64 : .58;
       if (kind === "game" && gameActiveRef.current && pitch.confidence > pitchGate && blockEnergy > .055) {
         smoothedPitch = smoothedPitch * .92 + pitch.midi * .08;
         const pitchChange = Math.abs(pitch.midi - lastStablePitch);
-        const melodyCooldown = difficulty === 1 ? beat * .9 : difficulty === 2 ? beat * .48 : beat * .24;
-        if (pitchChange > .85 && ctx.currentTime - lastMelodyAt > melodyCooldown && ctx.currentTime - lastOnsetAt > .055) {
+        const melodyCooldown = beat * (difficulty === 1 ? .46 : difficulty === 2 ? .28 : .12);
+        if (pitchChange > .72 && ctx.currentTime - lastMelodyAt > melodyCooldown && ctx.currentTime - lastOnsetAt > .045) {
           const relativeNow = (performance.now() - startRef.current) / 1000;
           const lane = clamp(Math.round(1.5 + (pitch.midi - smoothedPitch) / 2.5), 0, 3);
           rhythmEventsRef.current.push({ hitAt: relativeNow + 1.6, lane, strength: clamp(pitch.confidence * .7 + pitchChange * .08, 0, 1), hold: false, duration: 0, source: "melody" });
@@ -238,13 +245,13 @@ export default function Home() {
       }
       const callbackBudget=left.length/ctx.sampleRate*1000;callbackLoad=callbackLoad*.88+(performance.now()-callbackStarted)/callbackBudget*.12;
       if(hz>=ctx.sampleRate*.75){if(callbackLoad>.82)renderStride=mode==="funcbeat"?8:4;else if(callbackLoad>.58)renderStride=mode==="funcbeat"?4:2;else if(callbackLoad<.32)renderStride=mode==="funcbeat"?2:1}
-      previousEnergy = blockEnergy;
+      previousEnergy = blockEnergy; previousPeak = peak;
     };
     processor.connect(delay); delay.connect(filter); filter.connect(gain); gain.connect(ctx.destination);
     audioRef.current = { ctx, processor, filter, gain, kind };
     setAudioOn(true); setStatus(kind === "preview" ? "QUIET PREVIEW" : "SIGNAL LOCKED");
     return true;
-  }, [difficulty, formula, formulaHz, nValue, signalMode, track.bpm, volume, stopAudio]);
+  }, [difficulty, formula, formulaHz, nValue, sensitivity, signalMode, track.bpm, volume, stopAudio]);
 
   const chooseTrack = (i: number) => {
     const selected = TRACKS[i];
@@ -338,23 +345,24 @@ export default function Home() {
     let lastUiAt = -1;
     const loop = () => {
       const now = (performance.now() - startRef.current) / 1000;
-      const gridStep = difficulty === 1 ? beat : difficulty === 2 ? beat / 2 : beat / 4;
+      const gridStep = difficulty === 1 ? beat / 4 : difficulty === 2 ? beat / 4 : beat / 8;
       const addNote = (hitAt: number, desiredLane: number, hold: boolean, duration: number) => {
         const cluster = notesRef.current.find(note=>Math.abs(note.hitAt-hitAt)<gridStep*.24);
         if(cluster) hitAt=cluster.hitAt;
         if (notesRef.current.some(note=>Math.abs(note.hitAt-hitAt)<.085 && note.lane===desiredLane)) return;
         let lane = desiredLane; let found = false;
         const laneOffsets=[0,2,1,3];
-        for(const offset of laneOffsets){const candidate=(desiredLane+offset)%4;if(laneBusyUntilRef.current[candidate] < hitAt-.08){lane=candidate;found=true;break}}
+        for(const offset of laneOffsets){const candidate=(desiredLane+offset)%4;if(laneBusyUntilRef.current[candidate] < hitAt-.025){lane=candidate;found=true;break}}
         if(!found) return;
         notesRef.current.push({id:idRef.current++,lane,born:now,hitAt,kind:hold?"hold":"tap",duration:hold?duration:0});
-        laneBusyUntilRef.current[lane]=hitAt+(hold?duration:.1)+.08;
+        laneBusyUntilRef.current[lane]=hitAt+(hold?duration:.045)+.025;
       };
 
       const detected = rhythmEventsRef.current.splice(0);
       for(const event of detected){
         const hitAt=1.6+Math.round((event.hitAt-1.6)/gridStep)*gridStep;
-        const minimumSpacing=difficulty===1?beat*.68:difficulty===2?beat*.46:beat*.2;
+        const baseSpacing=difficulty===1?beat*.46:difficulty===2?beat*.28:beat*.11;
+        const minimumSpacing=event.strength>.7?baseSpacing*.72:baseSpacing;
         const sameCluster=Math.abs(hitAt-lastDetectedHitRef.current)<gridStep*.12;
         if(hitAt<now+.28 || (!sameCluster && hitAt-lastDetectedHitRef.current<minimumSpacing)) continue;
         if(sameCluster && (difficulty===1 || event.strength<.62)) continue;
@@ -365,28 +373,24 @@ export default function Home() {
 
       while (now + 1.6 > nextBeatRef.current) {
         const signal=spectrumRef.current;
-        const pulse = signal.energy + signal.peak * .32;
         const threshold = (100 - sensitivity) / 175;
         const subdivision = gridStep;
         const step = Math.round((nextBeatRef.current-1.6) / subdivision);
         const noNearbyDetection = Math.abs(nextBeatRef.current-lastDetectedHitRef.current) > subdivision*.62;
         const activity=clamp(signal.intensity+signal.energy*.34+signal.flux*.7,0,1);
-        const primary=difficulty===1?true:difficulty===2?step%2===0:step%4===0;
-        const secondary=difficulty===2?step%2===1:step%2===0;
-        const relaxedGate=threshold*.42;
-        const structuralBeat=difficulty===1
-          ? activity>.52 || (activity>relaxedGate && step%2===0)
-          : difficulty===2
-            ? (primary && activity>relaxedGate) || (!primary && activity>.72 && pulse>threshold*.72)
-            : (primary && activity>relaxedGate*.75) || (secondary && activity>.46) || activity>.82;
-        if(noNearbyDetection && !signal.silence && structuralBeat){
-          const patterns=difficulty===1?[0,1,2,3,2,1]:difficulty===2?[0,2,1,3,3,1,2,0]:[0,3,1,2,2,1,3,0];
+        const gapSinceEvent=nextBeatRef.current-lastDetectedHitRef.current;
+        const rescueGap=beat*(difficulty===1?2.5:difficulty===2?1.75:1.25);
+        const clearAttack=signal.onset>(.018+threshold*.035) && activity>(difficulty===1?.3:difficulty===2?.24:.18);
+        const rescueEvent=gapSinceEvent>rescueGap && clearAttack;
+        if(noNearbyDetection && !signal.silence && rescueEvent){
+          const patterns=difficulty===1?[0,0,2,1,1,3]:difficulty===2?[0,0,1,3,3,2,2,1]:[0,0,3,1,1,2,2,3];
           const lane=patterns[(step+trackIndex*2)%patterns.length];
           const stableSignal=signal.pitchConfidence>.48 || (signal.energy>.18 && signal.peak<signal.energy*2.8);
-          const holdCycle=difficulty===1?12:difficulty===2?16:20;
-          const isHold=step>4 && step%holdCycle===0 && stableSignal;
+          const holdCycle=difficulty===1?24:difficulty===2?28:32;
+          const isHold=step>8 && step%holdCycle===0 && stableSignal;
           const holdDuration=beat*(difficulty===1?1.25:difficulty===2?1.5:2.25);
           addNote(nextBeatRef.current,lane,isHold,isHold?holdDuration:0);
+          lastDetectedHitRef.current=nextBeatRef.current;
         }
         nextBeatRef.current += subdivision;
       }
