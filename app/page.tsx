@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-type SignalMode = "bytebeat" | "signed" | "floatbeat";
+type SignalMode = "bytebeat" | "signed" | "floatbeat" | "funcbeat";
 type Track = { name: string; author: string; bpm: number; color: string; formula: string; blurb: string; mode: SignalMode; hz: number; n: number; volume: number };
 type Note = { id: number; lane: number; born: number; hitAt: number; kind: "tap" | "hold"; duration: number; pressed?: boolean; hit?: boolean; missed?: boolean };
 type Particle = { x: number; y: number; vx: number; vy: number; life: number; size: number };
@@ -42,13 +42,20 @@ const TIMING_WINDOWS = [
 const JUDGE_POSITION = 88;
 const clamp = (n: number, a: number, b: number) => Math.max(a, Math.min(b, n));
 
-function compileFormula(source: string) {
+function compileFormula(source: string, mode?: SignalMode) {
   const cleaned = source.replaceAll("\\*", "*").replaceAll("\\_", "_");
-  return new Function("M", `
+  const prelude = `
     const {abs,acos,acosh,asin,asinh,atan,atan2,atanh,cbrt,ceil,cos,cosh,exp,expm1,floor,fround,hypot,imul,log,log10,log1p,log2,max,min,pow,random,round,sign,sin,sinh,sqrt,tan,tanh,trunc,PI,E,LN2,LN10,LOG2E,LOG10E,SQRT1_2,SQRT2}=M;
     const int=x=>x|0, ln=log;
-    return function(t,sr,n){ return (${cleaned}); };
-  `)(Math) as (t: number, sr: number, n: number) => FormulaSample;
+  `;
+  const compileProgram = () => {
+    const renderer = new Function("M", `${prelude}${cleaned}`)(Math);
+    if (typeof renderer !== "function") throw new Error("FUNCBEAT MUST RETURN FUNCTION(TIME)");
+    return ((t: number, sr: number, n: number) => renderer(t / sr, n, sr)) as (t: number, sr: number, n: number) => FormulaSample;
+  };
+  if (mode === "funcbeat") return compileProgram();
+  try { return new Function("M", `${prelude}return function(t,sr,n){ return (${cleaned}); };`)(Math) as (t: number, sr: number, n: number) => FormulaSample; }
+  catch { return compileProgram(); }
 }
 
 function evaluateFormula(fn: ReturnType<typeof compileFormula>, t: number, sr: number, n: number, fallback: FormulaSample = 0) {
@@ -63,7 +70,7 @@ function evaluateFormula(fn: ReturnType<typeof compileFormula>, t: number, sr: n
 
 function normalizeSample(value: number, mode: SignalMode) {
   if (!Number.isFinite(value)) return 0;
-  if (mode === "floatbeat") return clamp(value, -1, 1);
+  if (mode === "floatbeat" || mode === "funcbeat") return clamp(value, -1, 1);
   const integer = Math.floor(value);
   if (mode === "bytebeat") return ((integer & 255) - 128) / 128;
   return (((integer + 128) & 255) - 128) / 128;
@@ -127,7 +134,7 @@ export default function Home() {
     const n = override?.n ?? nValue;
     const outputVolume = override?.volume ?? volume;
     let fn: ReturnType<typeof compileFormula>;
-    try { fn = compileFormula(source); let testSample: FormulaSample=0; for (let i = 0; i < 32; i++) testSample=evaluateFormula(fn,i * 257,hz,n,testSample); }
+    try { fn = compileFormula(source,mode); let testSample: FormulaSample=0; for (let i = 0; i < 32; i++) testSample=evaluateFormula(fn,i * 257,hz,n,testSample); }
     catch { setStatus("FORMULA ERROR"); return false; }
     const ctx = new AudioContext({ latencyHint: "interactive" });
     try { await ctx.resume(); } catch { setStatus("CLICK PREVIEW TO ENABLE AUDIO"); return false; }
@@ -139,7 +146,7 @@ export default function Home() {
     gain.gain.value = clamp(outputVolume / 100, 0, 1.5) * (kind === "preview" ? .22 : 1);
     playbackSpeedRef.current=1;
     let tick = 0; let lastFormulaTick = -1; let cachedResult: FormulaSample = 0; let runtimeFailed = false;
-    let renderStride=1;let callbackLoad=0;
+    let renderStride=mode==="funcbeat"?2:1;let callbackLoad=0;
     let previousMono = 0; let previousEnergy = 0; let adaptiveFlux = .025; let lastOnsetAt = -10; let eventIndex = 0;
     processor.onaudioprocess = (event) => {
       const callbackStarted=performance.now();
@@ -165,7 +172,7 @@ export default function Home() {
         if (!runtimeFailed) { runtimeFailed = true; const message = error instanceof Error ? error.message : "unknown error"; setStatus(`RUNTIME ERROR: ${message.toUpperCase().slice(0,48)}`); }
       }
       const callbackBudget=left.length/ctx.sampleRate*1000;callbackLoad=callbackLoad*.88+(performance.now()-callbackStarted)/callbackBudget*.12;
-      if(hz>=ctx.sampleRate*.75){if(callbackLoad>.82)renderStride=4;else if(callbackLoad>.58)renderStride=2;else if(callbackLoad<.32)renderStride=1}
+      if(hz>=ctx.sampleRate*.75){if(callbackLoad>.82)renderStride=mode==="funcbeat"?8:4;else if(callbackLoad>.58)renderStride=mode==="funcbeat"?4:2;else if(callbackLoad<.32)renderStride=mode==="funcbeat"?2:1}
       spectrumRef.current.energy = energy / left.length;
       spectrumRef.current.peak = peak;
       const blockEnergy = energy / left.length; const blockFlux = flux / left.length;
@@ -380,7 +387,7 @@ export default function Home() {
         <div className="visual-card"><canvas ref={canvasRef}/><div className="visual-label"><span>LIVE SIGNAL</span><b>{track.name}</b></div><div className="reticle">+</div></div>
         <div className="config-panel">
           <div className="panel-title"><span>02</span><div><b>CALIBRATE</b><small>GAMEPLAY RESPONSE</small></div></div>
-          <label>SIGNAL MODE <span>{signalMode.toUpperCase()}</span></label><div className="mode-tabs">{(["bytebeat","signed","floatbeat"] as SignalMode[]).map(mode=><button key={mode} onClick={()=>{setSignalMode(mode);schedulePreview(formula,{mode})}} className={signalMode===mode?"on":""}>{mode === "signed" ? "SIGNED 8-BIT" : mode.toUpperCase()}</button>)}</div>
+          <label>SIGNAL MODE <span>{signalMode.toUpperCase()}</span></label><div className="mode-tabs">{(["bytebeat","signed","floatbeat","funcbeat"] as SignalMode[]).map(mode=><button key={mode} onClick={()=>{setSignalMode(mode);schedulePreview(formula,{mode})}} className={signalMode===mode?"on":""}>{mode === "signed" ? "SIGNED 8-BIT" : mode.toUpperCase()}</button>)}</div>
           <div className="parameter-grid">
             <label><span>FORMULA Hz</span><input aria-label="Formula sample rate in hertz" type="number" min="1000" max="96000" step="100" value={formulaHz} onChange={e=>{const hz=clamp(+e.target.value||1000,1000,96000);setFormulaHz(hz);schedulePreview(formula,{hz})}}/></label>
             <label><span>n VALUE</span><input aria-label="Formula n value" type="number" min="-16" max="16" step="0.05" value={nValue} onChange={e=>{const n=clamp(+e.target.value||0,-16,16);setNValue(n);schedulePreview(formula,{n})}}/></label>
@@ -398,7 +405,7 @@ export default function Home() {
           <button className="preview-button" onClick={()=>audioRef.current?.kind === "preview" ? stopAudio() : void startAudio("preview")}>{audioRef.current?.kind === "preview" ? "■ STOP PREVIEW" : "▶ QUIET PREVIEW"}</button>
           <button className="launch" onClick={launch}><span>INITIALIZE RUN</span><b>↗</b></button><p className="hint">KEYS&nbsp; D · F · J · K &nbsp;/&nbsp; TOUCH</p>
         </div>
-        <details className="formula-panel"><summary><span>03</span><b>FORMULA SOURCE</b><small>EDIT / PASTE BYTEBEAT</small></summary><textarea spellCheck={false} value={formula} onChange={e=>{const value=e.target.value;setFormula(value);setStatus("COMPILING PREVIEW");schedulePreview(value)}}/><div className="mode-help"><b>{signalMode.toUpperCase()}</b><span>{signalMode === "bytebeat" ? "0…255 → преобразуется в −1…1" : signalMode === "signed" ? "−128…127 → преобразуется в −1…1" : "готовый сигнал −1…1 без 8-битного преобразования"}</span></div><div className="editor-foot"><span>JS EXPRESSION · t, sr, n AVAILABLE · DEBUG THROW SAFE</span><button onClick={()=>void startAudio("preview")}>CHECK + PREVIEW</button></div></details>
+        <details className="formula-panel"><summary><span>03</span><b>FORMULA SOURCE</b><small>EDIT / PASTE BYTEBEAT</small></summary><textarea spellCheck={false} value={formula} onChange={e=>{const value=e.target.value;setFormula(value);setStatus("COMPILING PREVIEW");schedulePreview(value)}}/><div className="mode-help"><b>{signalMode.toUpperCase()}</b><span>{signalMode === "bytebeat" ? "0…255 → преобразуется в −1…1" : signalMode === "signed" ? "−128…127 → преобразуется в −1…1" : signalMode === "funcbeat" ? "JS-программа должна вернуть function(time), где time — секунды" : "готовый сигнал −1…1 без 8-битного преобразования"}</span></div><div className="editor-foot"><span>{signalMode==="funcbeat"?"PROGRAM → FUNCTION(TIME) · ADAPTIVE RENDER":"JS EXPRESSION · t, sr, n AVAILABLE · DEBUG THROW SAFE"}</span><button onClick={()=>void startAudio("preview")}>CHECK + PREVIEW</button></div></details>
       </section>}
 
       {game !== "setup" && <section className={`game-shell ${game} ${modifiers.hidden?"hidden-mod":""}`}>
