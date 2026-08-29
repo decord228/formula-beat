@@ -486,64 +486,52 @@ export default function Home() {
     const gl=canvas.getContext("webgl",{alpha:false,antialias:false,depth:false,stencil:false,powerPreference:"high-performance"});if(!gl)return;
     const vertexSource=`attribute vec2 p;void main(){gl_Position=vec4(p,0.,1.);}`;
     const fragmentSource=`precision highp float;
-    uniform vec2 resolution;uniform float time;uniform float energy;uniform float beat;uniform float intensity;uniform float gameMode;uniform vec3 accent;
+    uniform vec2 resolution;uniform float time;uniform float travel;uniform float energy;uniform float beat;uniform float intensity;uniform float transient;uniform float pitch;uniform float gameMode;uniform vec3 accent;
     float hash(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
     float noise(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.-2.*f);return mix(mix(hash(i),hash(i+vec2(1.,0.)),f.x),mix(hash(i+vec2(0.,1.)),hash(i+1.),f.x),f.y);}
     mat2 rot(float a){float s=sin(a),c=cos(a);return mat2(c,-s,s,c);}
-    float stars(vec2 uv,float scale,float drift,float gate){vec2 p=uv*scale+vec2(time*drift,-time*drift*.63);vec2 id=floor(p),gv=fract(p)-.5;float seed=hash(id);vec2 offset=vec2(hash(id+17.3),hash(id+41.7))-.5;float d=length(gv-offset*.7);float twinkle=.55+.45*sin(time*(1.6+seed*3.2)+seed*18.);return smoothstep(.075,.006,d)*step(gate,seed)*twinkle;}
     void main(){
       vec2 uv=gl_FragCoord.xy/resolution;vec2 p=(gl_FragCoord.xy*2.-resolution)/resolution.y;
-      float drive=clamp(.11+energy*.7+intensity*.52+beat*.9,0.,1.);
-      vec3 ice=mix(accent,vec3(.48,.82,1.),.36);vec3 violet=mix(accent,vec3(.52,.16,1.),.58);
-      vec3 col=vec3(.004,.007,.016);
+      float drive=clamp(.08+energy*.55+intensity*.62,0.,1.);float hit=clamp(beat*.8+transient*.65,0.,1.);
+      float pitchAngle=(pitch-.5)*.16;vec2 scene=rot(pitchAngle)*p;vec3 ice=mix(accent,vec3(.48,.78,1.),.38);vec3 violet=mix(accent,vec3(.38,.16,.82),.52);
+      vec3 col=vec3(.003,.006,.015);
 
-      float dust=stars(uv,54.,.012+.012*drive,.90)+stars(uv,96.,-.022-.02*drive,.965)*.9+stars(uv,158.,.042+.05*drive,.988)*1.2;
-      col+=mix(ice,vec3(.82,.9,1.),.55)*dust*(.38+drive*.52);
+      float farDust=0.;vec2 farUv=uv*vec2(116.,68.)+vec2(time*.008,-time*.005);vec2 farId=floor(farUv),farGv=fract(farUv)-.5;float farSeed=hash(farId);
+      farDust=smoothstep(.058,.008,length(farGv-(vec2(hash(farId+7.3),hash(farId+19.1))-.5)*.72))*step(.976,farSeed)*(.62+.38*sin(time*(1.4+farSeed*2.8)+farSeed*21.));
+      col+=mix(ice,vec3(.9,.94,1.),.62)*farDust*(.28+drive*.28);
 
-      vec2 cloudP=rot(-.34)*p;
-      float cloudA=noise(cloudP*1.35+vec2(time*.026,-time*.018));
-      float cloudB=noise(cloudP*2.75+vec2(-time*.041,time*.017));
-      float cloudC=noise(cloudP*5.4+vec2(time*.018,time*.032));
-      float nebula=pow(clamp(cloudA*.58+cloudB*.29+cloudC*.13,0.,1.),2.15);
-      float nebulaBand=exp(-abs(cloudP.y+sin(cloudP.x*1.35+time*.06)*.18)*2.7);
-      col+=violet*nebula*nebulaBand*(.12+drive*.14);
-      col+=ice*pow(nebulaBand,3.)*(.018+drive*.035);
+      for(int i=0;i<7;i++){
+        float layer=float(i);float z=fract(layer/7.+travel);float scale=mix(1.8,12.5,z*z);
+        vec2 layerShift=vec2(hash(vec2(layer,3.1)),hash(vec2(layer,8.7)))*7.3;
+        vec2 field=scene*scale+layerShift;vec2 id=floor(field),gv=fract(field)-.5;float seed=hash(id+layer*31.7);
+        vec2 offset=(vec2(hash(id+layer+11.2),hash(id-layer+27.6))-.5)*.66;
+        vec2 local=gv-offset;float size=mix(.022,.19,z)*(1.+hit*.32);float point=smoothstep(size,.004,length(local))*step(mix(.89,.965,z),seed);
+        float fade=smoothstep(0.,.16,z)*(1.-smoothstep(.82,1.,z));float shimmer=.72+.28*sin(time*(1.8+seed*2.5)+seed*17.);
+        col+=mix(violet,ice,z)*point*fade*shimmer*(.42+drive*.7);
+      }
 
-      vec2 origin=vec2(gameMode>.5?0.:.22,-.03);
-      vec2 ray=p-origin;float radius=length(ray);float angle=atan(ray.y,ray.x);
-      float raySeed=hash(vec2(floor(angle*92.),0.));
-      float rays=pow(raySeed,8.)*exp(-abs(fract(radius*(4.5+drive*2.)-time*(.42+drive*.9))-.5)*24.);
-      col+=ice*rays*drive*(1.-smoothstep(.08,1.45,radius))*.24;
+      float radius=length(scene);float angle=atan(scene.y,scene.x);float raySeed=hash(vec2(floor(angle*118.),4.));
+      float dash=exp(-abs(fract(radius*(3.4+drive*2.2)-travel*5.)-.5)*mix(34.,13.,transient));
+      float warp=pow(raySeed,7.)*dash*(1.-smoothstep(.08,1.55,radius))*transient;
+      col+=ice*warp*.32;
 
-      float ribbonA=abs(cloudP.y-sin(cloudP.x*1.85+time*(.28+drive*.25))*(.11+drive*.06));
-      float ribbonB=abs(cloudP.y+sin(cloudP.x*1.28-time*.21+2.1)*.17-.34);
-      col+=accent*exp(-ribbonA*23.)*(.035+drive*.11);
-      col+=violet*exp(-ribbonB*18.)*(.028+drive*.075);
+      vec2 cloud=rot(-.42+pitchAngle*.6)*scene;float n1=noise(cloud*1.15+vec2(travel*.36,-time*.013));float n2=noise(cloud*2.45+vec2(-travel*.24,time*.018));
+      float corridor=exp(-abs(cloud.y+sin(cloud.x*.72+time*.045)*.16)*2.25);float nebula=pow(n1*.68+n2*.32,2.35)*corridor;
+      col+=violet*nebula*(.075+drive*.13);col+=ice*pow(corridor,5.)*n2*(.012+energy*.03);
 
-      float wavePhase=abs(fract(radius*.72-time*(.12+drive*.19))-.5);
-      float shock=exp(-wavePhase*52.)*(1.-smoothstep(.16,1.5,radius));
-      col+=mix(accent,ice,.52)*shock*(.045+beat*.34+drive*.055);
+      float pulsePhase=abs(fract(radius*.68-travel*.62)-.5);float pulseRing=exp(-pulsePhase*58.)*(1.-smoothstep(.16,1.48,radius));
+      col+=mix(accent,ice,.58)*pulseRing*(beat*.42+transient*.12);
 
-      float sweepY=fract(time*(.055+drive*.035))*2.7-1.35;
-      float sweep=exp(-abs(p.y-sweepY)*36.)*(1.-smoothstep(.15,1.5,abs(p.x)));
-      col+=ice*sweep*drive*.07;
-
-      vec2 comet=rot(-.48)*p;float cometCycle=fract(time*.075);float cometHead=mix(-1.8,1.8,cometCycle);
-      float cometDistance=cometHead-comet.x;float cometTrail=smoothstep(0.,.08,cometDistance)*(1.-smoothstep(.12,1.05,cometDistance));
-      float cometLine=exp(-abs(comet.y-.42)*92.)*cometTrail*(1.-smoothstep(.12,.96,abs(comet.x-cometHead)));
-      col+=ice*cometLine*(.16+drive*.2);
-
-      float horizon=exp(-abs(p.y+.68)*5.5)*(1.-smoothstep(.1,1.6,abs(p.x)));
-      col+=accent*horizon*(.025+drive*.045)*gameMode;
-      float vignette=1.-smoothstep(.24,1.48,length(p*vec2(.7,.88)));col*=.5+vignette*.66;
+      float coreGlow=exp(-radius*3.2);col+=accent*coreGlow*(.012+energy*.045+beat*.035)*gameMode;
+      float vignette=1.-smoothstep(.2,1.5,length(p*vec2(.7,.88)));col*=.48+vignette*.7;
       col=pow(col,vec3(.86));gl_FragColor=vec4(col,1.);
     }`;
     const compile=(type:number,source:string)=>{const shader=gl.createShader(type);if(!shader)return null;gl.shaderSource(shader,source);gl.compileShader(shader);if(!gl.getShaderParameter(shader,gl.COMPILE_STATUS)){gl.deleteShader(shader);return null}return shader};
     const vertex=compile(gl.VERTEX_SHADER,vertexSource),fragment=compile(gl.FRAGMENT_SHADER,fragmentSource);if(!vertex||!fragment)return;const program=gl.createProgram();if(!program)return;gl.attachShader(program,vertex);gl.attachShader(program,fragment);gl.linkProgram(program);if(!gl.getProgramParameter(program,gl.LINK_STATUS))return;
     const buffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,buffer);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,-1,1,1,-1,1,1]),gl.STATIC_DRAW);gl.useProgram(program);const position=gl.getAttribLocation(program,"p");gl.enableVertexAttribArray(position);gl.vertexAttribPointer(position,2,gl.FLOAT,false,0,0);
-    const resolution=gl.getUniformLocation(program,"resolution"),clock=gl.getUniformLocation(program,"time"),energyUniform=gl.getUniformLocation(program,"energy"),beatUniform=gl.getUniformLocation(program,"beat"),intensityUniform=gl.getUniformLocation(program,"intensity"),modeUniform=gl.getUniformLocation(program,"gameMode"),accentUniform=gl.getUniformLocation(program,"accent");const [red,green,blue]=colorChannels(track.color);gl.uniform3f(accentUniform,red,green,blue);gl.uniform1f(modeUniform,game==="setup"?0:1);
-    let animationId=0,quality=game==="setup"?.9:.78,lastFrame=0,sampleTime=0,sampleFrames=0;const resize=()=>{const rect=canvas.getBoundingClientRect(),ratio=Math.min(devicePixelRatio,1.25)*quality,width=Math.max(2,Math.round(rect.width*ratio)),height=Math.max(2,Math.round(rect.height*ratio));if(canvas.width!==width||canvas.height!==height){canvas.width=width;canvas.height=height;gl.viewport(0,0,width,height);gl.uniform2f(resolution,width,height)}};
-    const draw=(now:number)=>{resize();const delta=lastFrame?now-lastFrame:0;lastFrame=now;if(delta>0&&delta<100){sampleTime+=delta;sampleFrames++}if(sampleFrames>=120){const average=sampleTime/sampleFrames;quality=average>20?Math.max(.58,quality-.1):average<11?Math.min(game==="setup"?.9:.78,quality+.05):quality;sampleTime=0;sampleFrames=0}const signal=spectrumRef.current;const active=game==="setup"||game==="running"||game==="failing";signal.beatPulse*=active?.88:.72;gl.uniform1f(clock,now*.001);gl.uniform1f(energyUniform,active?clamp(signal.energy*2.3+signal.peak*.28,0,1):0);gl.uniform1f(beatUniform,active?signal.beatPulse:0);gl.uniform1f(intensityUniform,active?signal.intensity:0);gl.drawArrays(gl.TRIANGLES,0,6);animationId=requestAnimationFrame(draw)};
+    const resolution=gl.getUniformLocation(program,"resolution"),clock=gl.getUniformLocation(program,"time"),travelUniform=gl.getUniformLocation(program,"travel"),energyUniform=gl.getUniformLocation(program,"energy"),beatUniform=gl.getUniformLocation(program,"beat"),intensityUniform=gl.getUniformLocation(program,"intensity"),transientUniform=gl.getUniformLocation(program,"transient"),pitchUniform=gl.getUniformLocation(program,"pitch"),modeUniform=gl.getUniformLocation(program,"gameMode"),accentUniform=gl.getUniformLocation(program,"accent");const [red,green,blue]=colorChannels(track.color);gl.uniform3f(accentUniform,red,green,blue);gl.uniform1f(modeUniform,game==="setup"?0:1);
+    let animationId=0,quality=game==="setup"?.9:.78,lastFrame=0,sampleTime=0,sampleFrames=0,spaceTravel=0,visualEnergy=0,visualBeat=0,visualIntensity=0,visualTransient=0,visualPitch=.5;const resize=()=>{const rect=canvas.getBoundingClientRect(),ratio=Math.min(devicePixelRatio,1.25)*quality,width=Math.max(2,Math.round(rect.width*ratio)),height=Math.max(2,Math.round(rect.height*ratio));if(canvas.width!==width||canvas.height!==height){canvas.width=width;canvas.height=height;gl.viewport(0,0,width,height);gl.uniform2f(resolution,width,height)}};
+    const draw=(now:number)=>{resize();const delta=lastFrame?now-lastFrame:0;lastFrame=now;if(delta>0&&delta<100){sampleTime+=delta;sampleFrames++}if(sampleFrames>=120){const average=sampleTime/sampleFrames;quality=average>20?Math.max(.58,quality-.1):average<11?Math.min(game==="setup"?.9:.78,quality+.05):quality;sampleTime=0;sampleFrames=0}const signal=spectrumRef.current;const active=game==="setup"||game==="running"||game==="failing";signal.beatPulse*=active?.88:.72;const targetEnergy=active?clamp(signal.energy*2.3+signal.peak*.28,0,1):0,targetIntensity=active?clamp(signal.intensity,0,1):0,targetTransient=active?clamp(signal.onset*4.2+signal.flux*1.4,0,1):0,targetPitch=active&&signal.pitchConfidence>.35?((signal.pitch%12)+12)%12/12:.5;visualEnergy+=(targetEnergy-visualEnergy)*.08;visualIntensity+=(targetIntensity-visualIntensity)*.055;visualTransient+=(targetTransient-visualTransient)*(targetTransient>visualTransient?.28:.075);visualBeat+=(signal.beatPulse-visualBeat)*(signal.beatPulse>visualBeat?.34:.1);visualPitch+=(targetPitch-visualPitch)*.025;spaceTravel=(spaceTravel+delta*.001*(.045+visualIntensity*.11+visualBeat*.045))%100;gl.uniform1f(clock,now*.001);gl.uniform1f(travelUniform,spaceTravel);gl.uniform1f(energyUniform,visualEnergy);gl.uniform1f(beatUniform,visualBeat);gl.uniform1f(intensityUniform,visualIntensity);gl.uniform1f(transientUniform,visualTransient);gl.uniform1f(pitchUniform,visualPitch);gl.drawArrays(gl.TRIANGLES,0,6);animationId=requestAnimationFrame(draw)};
     animationId=requestAnimationFrame(draw);return()=>{cancelAnimationFrame(animationId);gl.deleteProgram(program);gl.deleteShader(vertex);gl.deleteShader(fragment);gl.deleteBuffer(buffer)};
   }, [game, track.color]);
 

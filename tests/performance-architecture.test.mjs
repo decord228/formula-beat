@@ -18,9 +18,11 @@ test("reactive background uses an adaptive high-performance GPU path", async () 
   assert.match(source, /getContext\("webgl"/);
   assert.match(source, /powerPreference:"high-performance"/);
   assert.match(source, /quality=average>20/);
-  assert.match(source, /float stars\(vec2 uv/);
+  assert.match(source, /for\(int i=0;i<7;i\+\+\)/);
   assert.match(source, /float nebula=/);
-  assert.match(source, /float shock=/);
+  assert.match(source, /float pulseRing=/);
+  assert.match(source, /signal\.onset\*4\.2\+signal\.flux\*1\.4/);
+  assert.match(source, /signal\.pitchConfidence/);
   assert.doesNotMatch(source, /coreRadius|float shell=/);
   assert.match(styles, /translate3d\(0,calc\(var\(--note-y/);
 });
