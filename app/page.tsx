@@ -32,6 +32,7 @@ const TIMING_WINDOWS = [
 ];
 const JUDGE_POSITION = 88;
 const clamp = (n: number, a: number, b: number) => Math.max(a, Math.min(b, n));
+const colorChannels = (hex: string) => [0,2,4].map(offset=>parseInt(hex.replace("#","").slice(offset,offset+2),16)/255) as [number,number,number];
 const formatTime = (seconds: number) => `${Math.floor(Math.max(0,seconds)/60)}:${Math.floor(Math.max(0,seconds)%60).toString().padStart(2,"0")}`;
 const accuracyOf = (stats: RunStats) => stats.total ? (stats.perfect + stats.great * .7 + stats.good * .4) / stats.total * 100 : 0;
 const rankOf = (stats: RunStats, auto: boolean) => {
@@ -93,6 +94,9 @@ export default function Home() {
   const [timingMs, setTimingMs] = useState<number | null>(null);
   const [pressedLanes, setPressedLanes] = useState<boolean[]>([false,false,false,false]);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const particleCanvasRef = useRef<HTMLCanvasElement>(null);
+  const highwayRef = useRef<HTMLDivElement>(null);
+  const noteElementsRef = useRef(new Map<number,HTMLElement>());
   const audioRef = useRef<{ ctx: AudioContext; processor: ScriptProcessorNode; filter: BiquadFilterNode; gain: GainNode; worker: Worker; kind: "preview" | "game" } | null>(null);
   const pendingWorkerRef = useRef<Worker | null>(null);
   const audioRequestRef = useRef(0);
@@ -373,9 +377,11 @@ export default function Home() {
   useEffect(() => {
     if (game !== "running") return;
     const beat = 60 / track.bpm;
+    let lastTimelineSync = -1;
     const loop = () => {
       const now = (performance.now() - startRef.current) / 1000;
-      setTimeline(now);
+      let uiDirty = false;
+      if (now - lastTimelineSync >= .1) { lastTimelineSync = now; setTimeline(now); }
       if(activeDuration>0&&now>=activeDuration){finishRun("complete");return}
       const gridStep = difficulty === 1 ? beat / 4 : difficulty === 2 ? beat / 4 : beat / 8;
       const addNote = (hitAt: number, desiredLane: number, hold: boolean, duration: number) => {
@@ -390,6 +396,7 @@ export default function Home() {
         if(!found) return;
         notesRef.current.push({id:idRef.current++,lane,born:now,hitAt,kind:hold?"hold":"tap",duration:hold?duration:0});
         laneBusyUntilRef.current[lane]=hitAt+(hold?duration:.045)+.025;
+        uiDirty = true;
       };
 
       const detected = rhythmEventsRef.current.splice(0);
@@ -431,23 +438,35 @@ export default function Home() {
       if(modifiers.auto){
         for(const note of notesRef.current){
           if(note.hit||note.missed||now<note.hitAt) continue;
-          if(note.kind==="hold"&&!note.pressed){recordGrade(note,"perfect");note.pressed=true;setPressedLanes(v=>v.map((pressed,i)=>i===note.lane?true:pressed));setLastJudgement("AUTO HOLD");setTimingMs(0);setScore(v=>v+1000);incrementCombo();burst(note.lane,10)}
-          else if(note.kind==="tap"){recordGrade(note,"perfect");note.hit=true;setLastJudgement("AUTO");setTimingMs(0);setScore(v=>v+1000);incrementCombo();burst(note.lane,16)}
+          if(note.kind==="hold"&&!note.pressed){recordGrade(note,"perfect");note.pressed=true;uiDirty=true;setPressedLanes(v=>v.map((pressed,i)=>i===note.lane?true:pressed));setLastJudgement("AUTO HOLD");setTimingMs(0);setScore(v=>v+1000);incrementCombo();burst(note.lane,10)}
+          else if(note.kind==="tap"){recordGrade(note,"perfect");note.hit=true;uiDirty=true;setLastJudgement("AUTO");setTimingMs(0);setScore(v=>v+1000);incrementCombo();burst(note.lane,16)}
         }
       }
       for (const note of notesRef.current) {
         if (note.kind === "hold" && note.pressed && !note.hit && !note.missed && now >= note.hitAt + note.duration) {
-          note.pressed = false; note.hit = true; statsRef.current.holds+=1; setPressedLanes(v=>v.map((pressed,i)=>i===note.lane?false:pressed)); setTimingMs(0); setScore(v=>v+Math.round(1200+note.duration*900)); incrementCombo(); setLastJudgement(modifiers.auto?"AUTO RELEASE":"HELD"); setHealth(v=>clamp(v+3,0,100)); burst(note.lane,28);
+          note.pressed = false; note.hit = true; uiDirty = true; statsRef.current.holds+=1; setPressedLanes(v=>v.map((pressed,i)=>i===note.lane?false:pressed)); setTimingMs(0); setScore(v=>v+Math.round(1200+note.duration*900)); incrementCombo(); setLastJudgement(modifiers.auto?"AUTO RELEASE":"HELD"); setHealth(v=>clamp(v+3,0,100)); burst(note.lane,28);
         } else if (!note.hit && !note.missed && !note.pressed && now - note.hitAt > TIMING_WINDOWS[difficulty-1].hit) {
-          recordMiss(note);note.missed = true; setTimingMs(null); setCombo(0); damageSync(TIMING_WINDOWS[difficulty-1].missDamage); setLastJudgement("MISS");
+          recordMiss(note);note.missed = true; uiDirty = true; setTimingMs(null); setCombo(0); damageSync(TIMING_WINDOWS[difficulty-1].missDamage); setLastJudgement("MISS");
         }
       }
+      const previousLength = notesRef.current.length;
       notesRef.current = notesRef.current.filter(n => now - (n.hitAt + n.duration) < .75);
-      setNotes([...notesRef.current]);
+      if (notesRef.current.length !== previousLength) uiDirty = true;
+
+      // Note motion bypasses React and stays on the compositor at the display refresh rate.
+      const laneHeight=highwayRef.current?.clientHeight||window.innerHeight*.89;
+      for(const note of notesRef.current){
+        const element=noteElementsRef.current.get(note.id);if(!element)continue;
+        const travel=1-(note.hitAt-now)/1.6;
+        const progress=clamp(travel,-.15,1+note.duration/1.6+.2);
+        element.style.setProperty("--note-y",`${progress*JUDGE_POSITION/100*laneHeight}px`);
+        if(modifiers.hidden&&!note.hit&&!note.missed)element.style.opacity=String(clamp((.78-travel)/.3,0,1));else element.style.removeProperty("opacity");
+      }
+      if(uiDirty)setNotes([...notesRef.current]);
       rafRef.current = requestAnimationFrame(loop);
     };
     rafRef.current = requestAnimationFrame(loop); return () => cancelAnimationFrame(rafRef.current);
-  }, [game, difficulty, sensitivity, track.bpm, trackIndex, burst, damageSync, modifiers.auto, activeDuration, finishRun, incrementCombo, recordGrade, recordMiss]);
+  }, [game, difficulty, sensitivity, track.bpm, trackIndex, burst, damageSync, modifiers.auto, modifiers.hidden, activeDuration, finishRun, incrementCombo, recordGrade, recordMiss]);
 
   useEffect(()=>{
     if(game!=="running"||health>0||modifiers.noFail)return;
@@ -464,33 +483,27 @@ export default function Home() {
 
   useEffect(() => {
     const canvas = canvasRef.current; if (!canvas) return;
-    const ctx = canvas.getContext("2d"); if (!ctx) return;
-    let frame = 0; let animationId = 0;
-    const draw = () => {
-      const rect = canvas.getBoundingClientRect(); const dpr = Math.min(devicePixelRatio, game==="setup"?2:1.5);
-      if (canvas.width !== rect.width * dpr || canvas.height !== rect.height * dpr) { canvas.width = rect.width * dpr; canvas.height = rect.height * dpr; }
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0); const w = rect.width, h = rect.height;
-      const signal = spectrumRef.current; const wave = signal.wave; const visualActive=game==="setup"||game==="running"||game==="failing";const energy=visualActive?signal.energy:0;const peak=visualActive?signal.peak:0;const pulse=visualActive?signal.beatPulse:0;signal.beatPulse*=visualActive?.88:.72;
-      ctx.globalAlpha=1;ctx.fillStyle="#000";ctx.fillRect(0,0,w,h);
-      const loudness=clamp(energy*.32+peak*.08,0,.24);if(loudness>.002){ctx.globalAlpha=loudness;ctx.fillStyle=track.color;ctx.fillRect(0,0,w,h);ctx.globalAlpha=1}
-      const inGame=game!=="setup";const pulseRadius=Math.min(w,h)*(.16+energy*.16+pulse*.24);const beatGlow=ctx.createRadialGradient(w*.5,h*.54,0,w*.5,h*.54,pulseRadius);beatGlow.addColorStop(0,track.color+"b8");beatGlow.addColorStop(.38,track.color+"3d");beatGlow.addColorStop(1,"transparent");ctx.globalAlpha=clamp(energy*1.2+peak*.18+pulse*.42,0,.8);ctx.fillStyle=beatGlow;ctx.fillRect(0,0,w,h);ctx.globalAlpha=1;
-      const grad = ctx.createRadialGradient(w*.5,h*(inGame?.68:.55),0,w*.5,h*.55,w*.72); grad.addColorStop(0,track.color+(inGame?"35":"20")); grad.addColorStop(.46,track.color+"0d"); grad.addColorStop(1,"transparent");ctx.globalAlpha=clamp(energy*2+peak*.25,0,1);ctx.fillStyle=grad;ctx.fillRect(0,0,w,h);ctx.globalAlpha=1;
-      if(inGame){
-        ctx.save(); ctx.strokeStyle=track.color; ctx.globalAlpha=clamp(energy*.24+peak*.03,0,.2); ctx.lineWidth=1;
-        for(let i=-9;i<=9;i++){ctx.beginPath();ctx.moveTo(w/2,h*.35);ctx.lineTo(w/2+i*w*.085,h);ctx.stroke()}
-        for(let i=0;i<8;i++){const y=h*.38+Math.pow(i/7,1.7)*h*.62;ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke()} ctx.restore();
-      }
-      ctx.save(); ctx.globalCompositeOperation="lighter";const visualGain=clamp(energy*4+peak*.45,0,1);
-      const bars=48; for(let i=0;i<bars;i++){const amp=Math.abs(wave[(i*2)%wave.length]);const bh=(.015+amp*.75+energy*.18)*h*(inGame?.34:.22)*(1+pulse*.72);const x=i/(bars-1)*w;ctx.globalAlpha=visualGain*(.1+amp*.55+pulse*.12);ctx.fillStyle=track.color;ctx.fillRect(x-w/bars*.28,h*.54-bh/2,w/bars*.56,bh)}
-      for(let layer=0;layer<3;layer++){ctx.beginPath();for(let i=0;i<wave.length;i++){const x=i/(wave.length-1)*w;const y=h*.54+wave[i]*h*(.10+layer*.055)*(1+pulse*.38);if(i)ctx.lineTo(x,y);else ctx.moveTo(x,y)}ctx.globalAlpha=visualGain*(.55-layer*.15);ctx.strokeStyle=track.color;ctx.lineWidth=layer===0?2+pulse*2:1;ctx.shadowBlur=20+pulse*24;ctx.shadowColor=track.color;ctx.stroke()}
-      ctx.shadowBlur=0; for(let ring=0;ring<6;ring++){const limit=Math.min(w,h)*.7;const r=(frame*(1.1+energy*3)+ring*limit/6)%limit;ctx.beginPath();ctx.arc(w/2,h*.54,r,0,Math.PI*2);ctx.globalAlpha=visualGain*(1-r/limit)*(.22+energy*.28);ctx.strokeStyle=track.color;ctx.lineWidth=1+energy*2;ctx.stroke()}
-      if(inGame){
-        particlesRef.current=particlesRef.current.filter(p=>p.life>0);
-        for(const p of particlesRef.current){p.x+=p.vx;p.y+=p.vy;p.vy+=.14;p.life-=.025;ctx.globalAlpha=p.life;ctx.fillStyle=track.color;ctx.shadowBlur=12;ctx.shadowColor=track.color;ctx.fillRect(p.x,p.y,p.size,p.size)}
-      }
-      ctx.restore(); frame++; animationId=requestAnimationFrame(draw);
-    }; animationId=requestAnimationFrame(draw); return()=>cancelAnimationFrame(animationId);
+    const gl=canvas.getContext("webgl",{alpha:false,antialias:false,depth:false,stencil:false,powerPreference:"high-performance"});if(!gl)return;
+    const vertexSource=`attribute vec2 p;void main(){gl_Position=vec4(p,0.,1.);}`;
+    const fragmentSource=`precision highp float;uniform vec2 resolution;uniform float time;uniform float energy;uniform float beat;uniform float intensity;uniform float gameMode;uniform vec3 accent;
+    float hash(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}mat2 rot(float a){float s=sin(a),c=cos(a);return mat2(c,-s,s,c);}float neon(float d,float w){return smoothstep(w,0.,d)+exp(-d*38.)*.32;}
+    void main(){vec2 uv=gl_FragCoord.xy/resolution;vec2 p=(gl_FragCoord.xy*2.-resolution)/resolution.y;float drive=clamp(energy*.8+intensity*.55+beat*.8,0.,1.);vec3 col=vec3(.007,.011,.013);
+    vec2 starGrid=(uv+vec2(time*.006,-time*.012))*vec2(92.,56.);vec2 starCell=floor(starGrid);float seed=hash(starCell);float star=step(.972,seed)*exp(-length(fract(starGrid)-.5)*17.);col+=mix(accent,vec3(.55,.9,1.),seed)*star*(.12+drive*.68);
+    float floorMask=1.-smoothstep(-.14,-.02,p.y);float depth=.38/max(.035,-p.y+.015);vec2 floorUv=vec2(p.x*depth,depth+time*(.5+drive*.72));vec2 gridCell=abs(fract(floorUv*vec2(1.2,.72))-.5);float grid=smoothstep(.456,.497,max(gridCell.x,gridCell.y));float gridFade=floorMask*(1.-smoothstep(1.3,11.,depth))*(.35+max(0.,-p.y));col+=accent*grid*gridFade*(.18+drive*.46)*mix(.28,1.,gameMode);
+    float angle=atan(p.y,p.x);float radius=length(p);float spokes=smoothstep(.965,1.,abs(sin(angle*8.+time*.35)));col+=accent*spokes*exp(-abs(radius-.72-time*.025)*2.4)*(.02+drive*.08)*gameMode;
+    vec2 center=vec2(gameMode > .5 ? .66 : .23,.07+sin(time*.62)*.025);vec2 q=rot(time*.17)*(p-center);float coreRadius=length(q);float shell=neon(abs(coreRadius-.255),.0035);vec2 a=rot(time*(.68+drive*.25))*q;vec2 b=rot(-time*(.5+drive*.18)+1.3)*q;float ringA=neon(abs(length(vec2(a.x,a.y*3.2))-.29),.0038);float ringB=neon(abs(length(vec2(b.x*3.35,b.y))-.29),.0038);float latitude=neon(abs(length(vec2(q.x,q.y*5.4))-.255),.003);vec3 ice=mix(accent,vec3(.45,.9,1.),.42);col+=accent*shell*(.38+drive*.35)+ice*(ringA+ringB+latitude)*(.42+drive*.72);col+=accent*exp(-coreRadius*8.)*(.08+drive*.48);col+=accent*exp(-abs(coreRadius-.255)*20.)*.08;
+    float waveA=abs(p.y-sin(p.x*2.6+time*(.6+drive))*(.05+drive*.1)-.25);float waveB=abs(p.y-sin(p.x*1.7-time*.46+2.)*(.035+drive*.07)+.31);col+=accent*exp(-waveA*30.)*(.025+drive*.16);col+=ice*exp(-waveB*34.)*(.018+drive*.1);
+    float vignette=1.-smoothstep(.3,1.45,length(p*vec2(.7,.88)));col*=.56+vignette*.6;col=pow(col,vec3(.88));gl_FragColor=vec4(col,1.);}`;
+    const compile=(type:number,source:string)=>{const shader=gl.createShader(type);if(!shader)return null;gl.shaderSource(shader,source);gl.compileShader(shader);if(!gl.getShaderParameter(shader,gl.COMPILE_STATUS)){gl.deleteShader(shader);return null}return shader};
+    const vertex=compile(gl.VERTEX_SHADER,vertexSource),fragment=compile(gl.FRAGMENT_SHADER,fragmentSource);if(!vertex||!fragment)return;const program=gl.createProgram();if(!program)return;gl.attachShader(program,vertex);gl.attachShader(program,fragment);gl.linkProgram(program);if(!gl.getProgramParameter(program,gl.LINK_STATUS))return;
+    const buffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,buffer);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,-1,1,1,-1,1,1]),gl.STATIC_DRAW);gl.useProgram(program);const position=gl.getAttribLocation(program,"p");gl.enableVertexAttribArray(position);gl.vertexAttribPointer(position,2,gl.FLOAT,false,0,0);
+    const resolution=gl.getUniformLocation(program,"resolution"),clock=gl.getUniformLocation(program,"time"),energyUniform=gl.getUniformLocation(program,"energy"),beatUniform=gl.getUniformLocation(program,"beat"),intensityUniform=gl.getUniformLocation(program,"intensity"),modeUniform=gl.getUniformLocation(program,"gameMode"),accentUniform=gl.getUniformLocation(program,"accent");const [red,green,blue]=colorChannels(track.color);gl.uniform3f(accentUniform,red,green,blue);gl.uniform1f(modeUniform,game==="setup"?0:1);
+    let animationId=0,quality=game==="setup"?.9:.78,lastFrame=0,sampleTime=0,sampleFrames=0;const resize=()=>{const rect=canvas.getBoundingClientRect(),ratio=Math.min(devicePixelRatio,1.25)*quality,width=Math.max(2,Math.round(rect.width*ratio)),height=Math.max(2,Math.round(rect.height*ratio));if(canvas.width!==width||canvas.height!==height){canvas.width=width;canvas.height=height;gl.viewport(0,0,width,height);gl.uniform2f(resolution,width,height)}};
+    const draw=(now:number)=>{resize();const delta=lastFrame?now-lastFrame:0;lastFrame=now;if(delta>0&&delta<100){sampleTime+=delta;sampleFrames++}if(sampleFrames>=120){const average=sampleTime/sampleFrames;quality=average>20?Math.max(.58,quality-.1):average<11?Math.min(game==="setup"?.9:.78,quality+.05):quality;sampleTime=0;sampleFrames=0}const signal=spectrumRef.current;const active=game==="setup"||game==="running"||game==="failing";signal.beatPulse*=active?.88:.72;gl.uniform1f(clock,now*.001);gl.uniform1f(energyUniform,active?clamp(signal.energy*2.3+signal.peak*.28,0,1):0);gl.uniform1f(beatUniform,active?signal.beatPulse:0);gl.uniform1f(intensityUniform,active?signal.intensity:0);gl.drawArrays(gl.TRIANGLES,0,6);animationId=requestAnimationFrame(draw)};
+    animationId=requestAnimationFrame(draw);return()=>{cancelAnimationFrame(animationId);gl.deleteProgram(program);gl.deleteShader(vertex);gl.deleteShader(fragment);gl.deleteBuffer(buffer)};
   }, [game, track.color]);
+
+  useEffect(()=>{if(game==="setup")return;const canvas=particleCanvasRef.current;if(!canvas)return;const ctx=canvas.getContext("2d",{alpha:true});if(!ctx)return;let animationId=0;const draw=()=>{const rect=canvas.getBoundingClientRect();if(canvas.width!==Math.round(rect.width)||canvas.height!==Math.round(rect.height)){canvas.width=Math.round(rect.width);canvas.height=Math.round(rect.height)}ctx.clearRect(0,0,canvas.width,canvas.height);ctx.globalCompositeOperation="lighter";particlesRef.current=particlesRef.current.filter(p=>p.life>0);for(const p of particlesRef.current){p.x+=p.vx;p.y+=p.vy;p.vy+=.14;p.life-=.025;ctx.globalAlpha=p.life;ctx.fillStyle=track.color;ctx.fillRect(p.x,p.y,p.size,p.size)}ctx.globalAlpha=1;animationId=requestAnimationFrame(draw)};animationId=requestAnimationFrame(draw);return()=>cancelAnimationFrame(animationId)},[game,track.color]);
 
   useEffect(() => () => stopAudio(), [stopAudio]);
 
@@ -533,8 +546,9 @@ export default function Home() {
 
       {game !== "setup" && <section className={`game-shell ${game} ${modifiers.hidden?"hidden-mod":""}`}>
         <canvas ref={canvasRef} className="game-bg"/>
+        <canvas ref={particleCanvasRef} className="game-particles"/>
         <div className="game-hud"><div><small>SCORE</small><b>{score.toString().padStart(7,"0")}</b></div><div className="now-playing"><i/><span>{track.name}<small>{track.bpm} BPM · {signalMode.toUpperCase()} · {formulaHz} Hz · {activeDuration?`${formatTime(timeline)} / ${formatTime(activeDuration)}`:"ENDLESS"}{modifiers.auto?" · AUTOBOT":""}</small></span></div><div className="hp"><small>SYNC</small><span><i style={{width:`${health}%`}}/></span></div></div>
-        <div className="highway"><div className="hit-guide"><span>HIT ZONE</span><small>PERFECT ±{Math.round(TIMING_WINDOWS[difficulty-1].perfect*1000)} ms</small></div>{LANES.map((key,lane)=><button key={key} onPointerDown={e=>{e.currentTarget.setPointerCapture(e.pointerId);pressLane(lane)}} onPointerUp={()=>releaseLane(lane)} onPointerCancel={()=>releaseLane(lane)} className={`lane ${pressedLanes[lane]?"pressed":""}`}><span className="rail"/><b>{key}</b>{notes.filter(n=>n.lane===lane).map(n=>{const travel=1-(n.hitAt-timeline)/1.6;const p=clamp(travel,-.15,1+n.duration/1.6+.2);const hiddenOpacity=modifiers.hidden?clamp((.78-travel)/.3,0,1):undefined;return <i key={n.id} className={`note ${n.kind} ${n.pressed?"holding":""} ${n.hit?"hit":""} ${n.missed?"missed":""}`} style={{top:`${p*JUDGE_POSITION}%`,height:n.kind==="hold"?`${Math.max(10,n.duration/1.6*JUDGE_POSITION)}%`:undefined,opacity:hiddenOpacity}}/>})}</button>)}</div>
+        <div className="highway" ref={highwayRef}><div className="hit-guide"><span>HIT ZONE</span><small>PERFECT ±{Math.round(TIMING_WINDOWS[difficulty-1].perfect*1000)} ms</small></div>{LANES.map((key,lane)=><button key={key} onPointerDown={e=>{e.currentTarget.setPointerCapture(e.pointerId);pressLane(lane)}} onPointerUp={()=>releaseLane(lane)} onPointerCancel={()=>releaseLane(lane)} className={`lane ${pressedLanes[lane]?"pressed":""}`}><span className="rail"/><b>{key}</b>{notes.filter(n=>n.lane===lane).map(n=><i key={n.id} ref={element=>{if(element)noteElementsRef.current.set(n.id,element);else noteElementsRef.current.delete(n.id)}} className={`note ${n.kind} ${n.pressed?"holding":""} ${n.hit?"hit":""} ${n.missed?"missed":""}`} style={{height:n.kind==="hold"?`${Math.max(10,n.duration/1.6*JUDGE_POSITION)}%`:undefined}}/>)}</button>)}</div>
         <div className={`judgement ${lastJudgement.toLowerCase()}`}>{lastJudgement}<small>{timingMs!==null?`${timingMs>0?"+":""}${timingMs} ms`:combo>1?`${combo}× COMBO`:""}</small></div>
         <button className="exit" onClick={()=>{if(game==="running"||game==="paused")togglePause();else{stopAudio();setGame("setup");setStatus("FORMULA READY")}}}>{game==="paused"?"ESC · RESUME":game==="running"?"ESC · PAUSE":"ESC · ABORT"}</button>
         {game === "countdown" && <div className="countdown-overlay"><small>CALIBRATING PLAYFIELD</small><b key={countdown}>{countdown}</b><span>GET READY</span></div>}
