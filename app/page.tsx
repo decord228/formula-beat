@@ -573,7 +573,12 @@ export default function Home() {
           <button className="preview-button" onClick={()=>audioKind === "preview" ? stopAudio() : void startAudio("preview")}>{audioKind === "preview" ? "■ STOP PREVIEW" : "▶ QUIET PREVIEW"}</button>
           <button className="launch" onClick={launch}><span>INITIALIZE RUN</span><b>↗</b></button><p className="hint">KEYS&nbsp; D · F · J · K &nbsp;/&nbsp; TOUCH</p>
         </div>
-        <details className="formula-panel"><summary><span>03</span><b>FORMULA SOURCE</b><small>EDIT / PASTE BYTEBEAT</small></summary><textarea spellCheck={false} value={formula} onChange={e=>{const value=e.target.value;setFormula(value);setStatus("COMPILING PREVIEW");schedulePreview(value)}}/><div className="mode-help"><b>{signalMode.toUpperCase()}</b><span>{signalMode === "bytebeat" ? "0…255 → преобразуется в −1…1" : signalMode === "signed" ? "−128…127 → преобразуется в −1…1" : signalMode === "funcbeat" ? "function(time, sampleRate, n) или stateful-выражение; формат определяется автоматически" : "готовый сигнал −1…1 без 8-битного преобразования"}</span></div><div className="editor-foot"><span>{signalMode==="funcbeat"?"AUTO PROGRAM / EXPRESSION · NATIVE RATE · STEREO":"JS EXPRESSION · t, sr, n AVAILABLE · DEBUG THROW SAFE"}</span><button onClick={()=>void startAudio("preview")}>CHECK + PREVIEW</button></div></details>
+        <section className="formula-panel" aria-labelledby="formula-source-title">
+          <div className="panel-title formula-panel-title"><span>03</span><div><b id="formula-source-title">FORMULA SOURCE</b><small>EDIT / PASTE BYTEBEAT</small></div></div>
+          <textarea aria-label="Formula source" spellCheck={false} value={formula} onChange={e=>{const value=e.target.value;setFormula(value);setStatus("COMPILING PREVIEW");schedulePreview(value)}}/>
+          <div className="mode-help"><b>{signalMode.toUpperCase()}</b><span>{signalMode === "bytebeat" ? "0…255 → преобразуется в −1…1" : signalMode === "signed" ? "−128…127 → преобразуется в −1…1" : signalMode === "funcbeat" ? "function(time, sampleRate, n) или stateful-выражение; формат определяется автоматически" : "готовый сигнал −1…1 без 8-битного преобразования"}</span></div>
+          <div className="editor-foot"><span>{signalMode==="funcbeat"?"AUTO PROGRAM / EXPRESSION · NATIVE RATE · STEREO":"JS EXPRESSION · t, sr, n AVAILABLE · DEBUG THROW SAFE"}</span><button onClick={()=>void startAudio("preview")}>CHECK + PREVIEW</button></div>
+        </section>
       </section>}
 
       {game !== "setup" && <section className={`game-shell ${game} ${modifiers.hidden?"hidden-mod":""}`}>

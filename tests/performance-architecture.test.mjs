@@ -26,3 +26,16 @@ test("reactive background uses an adaptive high-performance GPU path", async () 
   assert.doesNotMatch(source, /coreRadius|float shell=/);
   assert.match(styles, /translate3d\(0,calc\(var\(--note-y/);
 });
+
+test("formula editor stays open beside the calibration panel", async () => {
+  const [source, styles] = await Promise.all([
+    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+  ]);
+  assert.match(source, /<section className="formula-panel"/);
+  assert.match(source, /<textarea aria-label="Formula source"/);
+  assert.doesNotMatch(source, /<details className="formula-panel"/);
+  assert.match(styles, /\.config-panel\{grid-column:2;grid-row:2\}/);
+  assert.match(styles, /\.formula-panel\{grid-column:3;grid-row:2;/);
+  assert.match(styles, /\.formula-panel textarea\{flex:1 1 auto;/);
+});
