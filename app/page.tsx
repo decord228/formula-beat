@@ -2,6 +2,9 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import sixthWaveFormula from "../public/6th-wave.txt?raw";
+import longWarmthFormula from "../public/long-warmth.txt?raw";
+import trinitraneFormula from "../public/trinitrane.txt?raw";
+import phaseArrayFormula from "../public/phase-array.txt?raw";
 
 type SignalMode = "bytebeat" | "signed" | "floatbeat" | "funcbeat";
 type Grade = "perfect" | "great" | "good";
@@ -21,6 +24,21 @@ const TRACKS: Track[] = [
     name: "6TH WAVE", author: "feeshbread", bpm: 79, color: "#61e7ff",
     blurb: "ByteBattle S3 · full stereo journey · 05:41", mode: "funcbeat", hz: 48000, n: 1, volume: 78,
     formula: sixthWaveFormula, duration: SIXTH_WAVE_DURATION,
+  },
+  {
+    name: "LONG WARMTH", author: "Decent-Manager-6169", bpm: 96, color: "#ff9a62",
+    blurb: "ByteBattle S4 · evolving stereo warmth · 04:04", mode: "funcbeat", hz: 44100, n: 1, volume: 86,
+    formula: longWarmthFormula, duration: 244,
+  },
+  {
+    name: "TRINITRANE", author: "N3", bpm: 160, color: "#ff4fd8",
+    blurb: "ByteBattle S6 · high-energy stereo suite · 03:27", mode: "funcbeat", hz: 48000, n: 1, volume: 76,
+    formula: trinitraneFormula, duration: 207,
+  },
+  {
+    name: "PHASE ARRAY", author: "UNKNOWN", bpm: 88, color: "#a8ff5f",
+    blurb: "stateful stereo synth journey · 03:17", mode: "funcbeat", hz: 48000, n: 1, volume: 82,
+    formula: phaseArrayFormula, duration: 197,
   },
 ];
 

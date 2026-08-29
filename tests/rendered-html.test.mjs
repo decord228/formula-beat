@@ -34,3 +34,12 @@ test("ships the current complete 6th Wave experience", async () => {
   assert.match(page, /rankOf\(finalStats/);
   assert.match(layout, /Formula Beat/);
 });
+
+test("ships the expanded default funcbeat library", async () => {
+  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  assert.match(page, /name: "LONG WARMTH"/);
+  assert.match(page, /name: "TRINITRANE"/);
+  assert.match(page, /name: "PHASE ARRAY"/);
+  assert.match(page, /Decent-Manager-6169/);
+  assert.match(page, /author: "N3"/);
+});
