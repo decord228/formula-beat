@@ -46,3 +46,7 @@
 .note.hit{transform:translate3d(0,calc(var(--note-y,-60px) - 100%),0) scale(1.8)}
 .note.missed{transform:translate3d(0,calc(var(--note-y,-60px) - 100%),0)}
 @media(prefers-reduced-motion:reduce){.note{will-change:auto}}
+
+/* Visible fallback plus a brighter, unblurred music stage when WebGL is active. */
+.game-shell{background-color:#050807;background-image:linear-gradient(155deg,#081715 0%,#040807 42%,#09040d 100%)}
+.game-bg{opacity:.82;filter:saturate(1.18);mix-blend-mode:screen}

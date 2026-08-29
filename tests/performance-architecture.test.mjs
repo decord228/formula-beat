@@ -10,7 +10,7 @@ test("gameplay motion is refresh-rate driven without per-frame React renders", a
   assert.match(source, /if\(uiDirty\)setNotes\(\[\.\.\.notesRef\.current\]\)/);
 });
 
-test("reactive background uses an adaptive high-performance GPU path", async () => {
+test("reactive background uses an adaptive music-driven 3D stage", async () => {
   const [source, styles] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
@@ -18,12 +18,16 @@ test("reactive background uses an adaptive high-performance GPU path", async () 
   assert.match(source, /getContext\("webgl"/);
   assert.match(source, /powerPreference:"high-performance"/);
   assert.match(source, /quality=average>20/);
-  assert.match(source, /for\(int i=0;i<7;i\+\+\)/);
-  assert.match(source, /float nebula=/);
-  assert.match(source, /float pulseRing=/);
+  assert.match(source, /alpha:true/);
+  assert.match(source, /uniform float waveform\[16\]/);
+  assert.match(source, /float cubeWire/);
+  assert.match(source, /float octaWire/);
+  assert.match(source, /float floorZ=1\.\/floorDepth\+travel\*11\./);
+  assert.match(source, /gl\.uniform1fv\(waveformUniform,visualWave\)/);
   assert.match(source, /signal\.onset\*4\.2\+signal\.flux\*1\.4/);
   assert.match(source, /signal\.pitchConfidence/);
-  assert.doesNotMatch(source, /coreRadius|float shell=/);
+  assert.doesNotMatch(source, /nebula|farDust|pulseRing|coreRadius|float shell=/);
+  assert.match(styles, /\.game-bg\{opacity:\.82;filter:saturate\(1\.18\)/);
   assert.match(styles, /translate3d\(0,calc\(var\(--note-y/);
 });
 
