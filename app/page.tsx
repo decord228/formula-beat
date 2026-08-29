@@ -1,35 +1,26 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import sixthWaveFormula from "../public/6th-wave.txt?raw";
 
 type SignalMode = "bytebeat" | "signed" | "floatbeat" | "funcbeat";
-type Track = { name: string; author: string; bpm: number; color: string; formula: string; blurb: string; mode: SignalMode; hz: number; n: number; volume: number };
-type Note = { id: number; lane: number; born: number; hitAt: number; kind: "tap" | "hold"; duration: number; pressed?: boolean; hit?: boolean; missed?: boolean };
+type Grade = "perfect" | "great" | "good";
+type Track = { name: string; author: string; bpm: number; color: string; formula: string; blurb: string; mode: SignalMode; hz: number; n: number; volume: number; duration: number };
+type Note = { id: number; lane: number; born: number; hitAt: number; kind: "tap" | "hold"; duration: number; grade?: Grade; pressed?: boolean; hit?: boolean; missed?: boolean };
 type Particle = { x: number; y: number; vx: number; vy: number; life: number; size: number };
 type RhythmEvent = { hitAt: number; lane: number; strength: number; hold: boolean; duration: number; source: "transient" | "melody" };
 type Modifiers = { auto: boolean; noFail: boolean; hidden: boolean };
 type PcmBlock = { left: Float32Array; right: Float32Array };
+type RunStats = { perfect: number; great: number; good: number; miss: number; holds: number; total: number; maxCombo: number };
+
+const EMPTY_STATS: RunStats = { perfect:0, great:0, good:0, miss:0, holds:0, total:0, maxCombo:0 };
+const SIXTH_WAVE_DURATION = 1.6 + 14 * 2 ** 20 / .9 / 48000;
 
 const TRACKS: Track[] = [
   {
-    name: "NEON REVERB", author: "formula 01", bpm: 138, color: "#dfff00",
-    blurb: "Glass arpeggio / elastic echoes", mode: "floatbeat", hz: 48000, n: 1, volume: 74,
-    formula: "tanh(sin(t*2*PI*(110*n*2**([0,3,7,10][floor(t*4/sr)%4]/12))/sr)*(.34+.18*pow(1-t%(sr/4)/(sr/4),3)) + sin(2*PI*55*n*t/sr)*pow(1-t%(sr/2)/(sr/2),5)*.85 + (random()-.5)*pow(1-t%(sr/8)/(sr/8),9)*.16)",
-  },
-  {
-    name: "BASE 36", author: "formula 02", bpm: 112, color: "#ff4fd8",
-    blurb: "Bitcrushed melody / slow pulse", mode: "bytebeat", hz: 8000, n: 1, volume: 58,
-    formula: "(t*n*2**([0,3,7,10,7,3,12,10][(t>>12)&7]/12) + (t>>4) + (t*(t>>9|t>>13)&63)) & 255",
-  },
-  {
-    name: "CHROME KICK", author: "formula 03", bpm: 150, color: "#61e7ff",
-    blurb: "Sub pressure / fractured hats", mode: "floatbeat", hz: 48000, n: 1, volume: 68,
-    formula: "tanh(sin((t*n*2**('03202222222222270320222222233330'[(t>>13)&31]/12))/75)*.35 + cos(sqrt(t%8192))*pow(1-(t%8192)/8192,3)*1.4 + (random()-.5)*pow(1-(t%4096)/4096,7)*.25)",
-  },
-  {
-    name: "LOG CHOIR", author: "formula 04", bpm: 120, color: "#ffb000",
-    blurb: "Logarithmic stereo swarm", mode: "bytebeat", hz: 8000, n: 1, volume: 56,
-    formula: "H=i=128,s=t/5e3,o=[H,H],F=i=>((57454323>>4*i&31)-(s>>3&4))/12,(e=>{while(i--)o[i%2]+=sin(40*log(s%4)+9*s)/3+s%4*(exp(-s%1*2)*((t*2**[F(7)-2,5+i/90,F(~~s-4*(i<48))+i%4/H][i%3]+s%1*i/5&H)-64)+(t*2**(F(i%7)-(i/2&1))+1e4*sin(i+s/H))%H-64)/H})(),o",
+    name: "6TH WAVE", author: "feeshbread", bpm: 79, color: "#61e7ff",
+    blurb: "ByteBattle S3 · full stereo journey · 05:41", mode: "funcbeat", hz: 48000, n: 1, volume: 78,
+    formula: sixthWaveFormula, duration: SIXTH_WAVE_DURATION,
   },
 ];
 
@@ -41,6 +32,18 @@ const TIMING_WINDOWS = [
 ];
 const JUDGE_POSITION = 88;
 const clamp = (n: number, a: number, b: number) => Math.max(a, Math.min(b, n));
+const formatTime = (seconds: number) => `${Math.floor(Math.max(0,seconds)/60)}:${Math.floor(Math.max(0,seconds)%60).toString().padStart(2,"0")}`;
+const accuracyOf = (stats: RunStats) => stats.total ? (stats.perfect + stats.great * .7 + stats.good * .4) / stats.total * 100 : 0;
+const rankOf = (stats: RunStats, auto: boolean) => {
+  if (auto) return "AUTO";
+  const accuracy = accuracyOf(stats);
+  if (stats.miss === 0 && accuracy >= 99.5) return "SS";
+  if (accuracy >= 95) return "S";
+  if (accuracy >= 90) return "A";
+  if (accuracy >= 80) return "B";
+  if (accuracy >= 70) return "C";
+  return "D";
+};
 
 function detectPitch(samples: Float32Array, sampleRate: number) {
   const stride = 4;
@@ -79,8 +82,12 @@ export default function Home() {
   const [score, setScore] = useState(0);
   const [combo, setCombo] = useState(0);
   const [health, setHealth] = useState(100);
+  const [timeline, setTimeline] = useState(0);
+  const [finalStats, setFinalStats] = useState<RunStats>({...EMPTY_STATS});
+  const [runOutcome, setRunOutcome] = useState<"complete" | "failed">("failed");
   const [status, setStatus] = useState("FORMULA READY");
   const [audioOn, setAudioOn] = useState(false);
+  const [audioKind, setAudioKind] = useState<"preview" | "game" | null>(null);
   const [notes, setNotes] = useState<Note[]>([]);
   const [lastJudgement, setLastJudgement] = useState("");
   const [timingMs, setTimingMs] = useState<number | null>(null);
@@ -104,7 +111,9 @@ export default function Home() {
   const lastDetectedHitRef = useRef(-10);
   const playbackSpeedRef = useRef(1);
   const freezeTimeRef = useRef(0);
+  const statsRef = useRef<RunStats>({...EMPTY_STATS});
   const track = TRACKS[trackIndex];
+  const activeDuration = formula === track.formula ? track.duration : 0;
 
   const stopAudio = useCallback(() => {
     audioRequestRef.current+=1;
@@ -114,12 +123,44 @@ export default function Home() {
     const audio = audioRef.current;
     if (audio) { audio.worker.terminate(); audio.processor.disconnect(); audio.filter.disconnect(); audio.gain.disconnect(); void audio.ctx.close(); }
     audioRef.current = null;
-    setAudioOn(false);
+    setAudioOn(false);setAudioKind(null);
   }, []);
 
   const damageSync = useCallback((amount: number) => {
     setHealth(value => modifiers.noFail ? Math.max(1,value-amount) : clamp(value-amount,0,100));
   }, [modifiers.noFail]);
+
+  const incrementCombo = useCallback(() => {
+    setCombo(value => {
+      const next = value + 1;
+      statsRef.current.maxCombo = Math.max(statsRef.current.maxCombo, next);
+      return next;
+    });
+  }, []);
+
+  const recordGrade = useCallback((note: Note, grade: Grade) => {
+    if (note.grade) return;
+    note.grade = grade;
+    statsRef.current[grade] += 1;
+    statsRef.current.total += 1;
+  }, []);
+
+  const recordMiss = useCallback((note: Note) => {
+    if (note.grade) statsRef.current[note.grade] = Math.max(0, statsRef.current[note.grade] - 1);
+    else statsRef.current.total += 1;
+    note.grade = undefined;
+    statsRef.current.miss += 1;
+  }, []);
+
+  const finishRun = useCallback((outcome: "complete" | "failed") => {
+    freezeTimeRef.current=(performance.now()-startRef.current)/1000;
+    gameActiveRef.current=false;
+    setRunOutcome(outcome);
+    setFinalStats({...statsRef.current});
+    stopAudio();
+    setStatus(outcome === "complete" ? "WAVE COMPLETE" : "SIGNAL LOST");
+    setGame("results");
+  }, [stopAudio]);
 
   const startAudio = useCallback(async (kind: "preview" | "game" = "game", override?: Partial<{ formula: string; mode: SignalMode; hz: number; n: number; volume: number }>) => {
     stopAudio();
@@ -220,7 +261,7 @@ export default function Home() {
     };
     processor.connect(delay); delay.connect(filter); filter.connect(gain); gain.connect(ctx.destination);
     pendingWorkerRef.current=null;audioRef.current = { ctx, processor, filter, gain, worker:renderWorker,kind };
-    setAudioOn(true); setStatus(kind === "preview" ? "QUIET PREVIEW" : "SIGNAL LOCKED");
+    setAudioOn(true);setAudioKind(kind); setStatus(kind === "preview" ? "QUIET PREVIEW" : "SIGNAL LOCKED");
     return true;
   }, [difficulty, formula, formulaHz, nValue, sensitivity, signalMode, track.bpm, volume, stopAudio]);
 
@@ -239,7 +280,8 @@ export default function Home() {
     const ok = await startAudio("game"); if (!ok) return;
     if (audioRef.current) await audioRef.current.ctx.suspend();
     notesRef.current = []; particlesRef.current = []; rhythmEventsRef.current = []; laneBusyUntilRef.current = [0,0,0,0]; lastDetectedHitRef.current = -10;
-    setNotes([]); setScore(0); setCombo(0); setHealth(100); setPressedLanes([false,false,false,false]); setTimingMs(null);
+    statsRef.current={...EMPTY_STATS};setFinalStats({...EMPTY_STATS});setRunOutcome("failed");
+    setNotes([]); setScore(0); setCombo(0); setHealth(100); setTimeline(0); setPressedLanes([false,false,false,false]); setTimingMs(null);
     freezeTimeRef.current=0; nextBeatRef.current = 1.6; idRef.current = 1; playbackSpeedRef.current=1; gameActiveRef.current = false;
     setCountdown(3); setGame("countdown"); setLastJudgement(""); setStatus("GET READY");
     let remaining=3;
@@ -299,11 +341,12 @@ export default function Home() {
     const pts = label === "PERFECT" ? 1000 : label === "GREAT" ? 650 : 350;
     if (best.kind === "hold") { best.pressed = true; setLastJudgement("HOLD"); }
     else { best.hit = true; setLastJudgement(label); }
-    setTimingMs(Math.round(offset*1000)); setCombo(v => v + 1); setScore(v => v + pts); setHealth(v => clamp(v + 1.2, 0, 100));
+    recordGrade(best,label.toLowerCase() as Grade);
+    setTimingMs(Math.round(offset*1000)); incrementCombo(); setScore(v => v + pts); setHealth(v => clamp(v + 1.2, 0, 100));
     playHitSound(lane);
     burst(lane, best.kind === "hold" ? 10 : 18);
     setNotes([...notesRef.current]);
-  }, [burst, difficulty, game, modifiers.auto, playHitSound]);
+  }, [burst, difficulty, game, incrementCombo, modifiers.auto, playHitSound, recordGrade]);
 
   const releaseLane = useCallback((lane: number) => {
     setPressedLanes(v => v.map((pressed,i)=>i===lane?false:pressed));
@@ -313,13 +356,13 @@ export default function Home() {
     if (!hold) return;
     hold.pressed = false;
     if (now >= hold.hitAt + hold.duration - .16) {
-      hold.hit = true; setTimingMs(Math.round((now-(hold.hitAt+hold.duration))*1000)); setScore(v=>v+Math.round(1200+hold.duration*900)); setCombo(v=>v+1); setLastJudgement("RELEASE"); setHealth(v=>clamp(v+3,0,100)); burst(lane,28);
+      hold.hit = true; statsRef.current.holds+=1; setTimingMs(Math.round((now-(hold.hitAt+hold.duration))*1000)); setScore(v=>v+Math.round(1200+hold.duration*900)); incrementCombo(); setLastJudgement("RELEASE"); setHealth(v=>clamp(v+3,0,100)); burst(lane,28);
       playHitSound(lane, true);
     } else {
-      hold.missed = true; setTimingMs(Math.round((now-(hold.hitAt+hold.duration))*1000)); setCombo(0); setLastJudgement("EARLY"); damageSync(10);
+      recordMiss(hold);hold.missed = true; setTimingMs(Math.round((now-(hold.hitAt+hold.duration))*1000)); setCombo(0); setLastJudgement("EARLY"); damageSync(10);
     }
     setNotes([...notesRef.current]);
-  }, [burst, damageSync, game, modifiers.auto, playHitSound]);
+  }, [burst, damageSync, game, incrementCombo, modifiers.auto, playHitSound, recordMiss]);
 
   useEffect(() => {
     const down = (e: KeyboardEvent) => { const i = LANES.indexOf(e.key.toUpperCase()); if (i >= 0 && !e.repeat) pressLane(i); if (e.key === "Escape" && !e.repeat) { e.preventDefault(); if(game==="running"||game==="paused")togglePause();else if(game==="countdown"){stopAudio();setGame("setup");setStatus("FORMULA READY")} } };
@@ -332,8 +375,12 @@ export default function Home() {
     const beat = 60 / track.bpm;
     const loop = () => {
       const now = (performance.now() - startRef.current) / 1000;
+      setTimeline(now);
+      if(activeDuration>0&&now>=activeDuration){finishRun("complete");return}
       const gridStep = difficulty === 1 ? beat / 4 : difficulty === 2 ? beat / 4 : beat / 8;
       const addNote = (hitAt: number, desiredLane: number, hold: boolean, duration: number) => {
+        if(activeDuration>0&&hitAt>activeDuration-.18)return;
+        if(activeDuration>0&&hold){duration=Math.min(duration,activeDuration-hitAt-.12);if(duration<.3)hold=false}
         const cluster = notesRef.current.find(note=>Math.abs(note.hitAt-hitAt)<gridStep*.24);
         if(cluster) hitAt=cluster.hitAt;
         if (notesRef.current.some(note=>Math.abs(note.hitAt-hitAt)<.085 && note.lane===desiredLane)) return;
@@ -384,15 +431,15 @@ export default function Home() {
       if(modifiers.auto){
         for(const note of notesRef.current){
           if(note.hit||note.missed||now<note.hitAt) continue;
-          if(note.kind==="hold"&&!note.pressed){note.pressed=true;setPressedLanes(v=>v.map((pressed,i)=>i===note.lane?true:pressed));setLastJudgement("AUTO HOLD");setTimingMs(0);setScore(v=>v+1000);setCombo(v=>v+1);burst(note.lane,10)}
-          else if(note.kind==="tap"){note.hit=true;setLastJudgement("AUTO");setTimingMs(0);setScore(v=>v+1000);setCombo(v=>v+1);burst(note.lane,16)}
+          if(note.kind==="hold"&&!note.pressed){recordGrade(note,"perfect");note.pressed=true;setPressedLanes(v=>v.map((pressed,i)=>i===note.lane?true:pressed));setLastJudgement("AUTO HOLD");setTimingMs(0);setScore(v=>v+1000);incrementCombo();burst(note.lane,10)}
+          else if(note.kind==="tap"){recordGrade(note,"perfect");note.hit=true;setLastJudgement("AUTO");setTimingMs(0);setScore(v=>v+1000);incrementCombo();burst(note.lane,16)}
         }
       }
       for (const note of notesRef.current) {
         if (note.kind === "hold" && note.pressed && !note.hit && !note.missed && now >= note.hitAt + note.duration) {
-          note.pressed = false; note.hit = true; setPressedLanes(v=>v.map((pressed,i)=>i===note.lane?false:pressed)); setTimingMs(0); setScore(v=>v+Math.round(1200+note.duration*900)); setCombo(v=>v+1); setLastJudgement(modifiers.auto?"AUTO RELEASE":"HELD"); setHealth(v=>clamp(v+3,0,100)); burst(note.lane,28);
+          note.pressed = false; note.hit = true; statsRef.current.holds+=1; setPressedLanes(v=>v.map((pressed,i)=>i===note.lane?false:pressed)); setTimingMs(0); setScore(v=>v+Math.round(1200+note.duration*900)); incrementCombo(); setLastJudgement(modifiers.auto?"AUTO RELEASE":"HELD"); setHealth(v=>clamp(v+3,0,100)); burst(note.lane,28);
         } else if (!note.hit && !note.missed && !note.pressed && now - note.hitAt > TIMING_WINDOWS[difficulty-1].hit) {
-          note.missed = true; setTimingMs(null); setCombo(0); damageSync(TIMING_WINDOWS[difficulty-1].missDamage); setLastJudgement("MISS");
+          recordMiss(note);note.missed = true; setTimingMs(null); setCombo(0); damageSync(TIMING_WINDOWS[difficulty-1].missDamage); setLastJudgement("MISS");
         }
       }
       notesRef.current = notesRef.current.filter(n => now - (n.hitAt + n.duration) < .75);
@@ -400,20 +447,20 @@ export default function Home() {
       rafRef.current = requestAnimationFrame(loop);
     };
     rafRef.current = requestAnimationFrame(loop); return () => cancelAnimationFrame(rafRef.current);
-  }, [game, difficulty, sensitivity, track.bpm, trackIndex, burst, damageSync, modifiers.auto]);
+  }, [game, difficulty, sensitivity, track.bpm, trackIndex, burst, damageSync, modifiers.auto, activeDuration, finishRun, incrementCombo, recordGrade, recordMiss]);
 
   useEffect(()=>{
-    if(game==="running"&&health<=0&&!modifiers.noFail){
-      freezeTimeRef.current=(performance.now()-startRef.current)/1000;gameActiveRef.current=false;setLastJudgement("DESYNC");setTimingMs(null);setStatus("SIGNAL COLLAPSE");setGame("failing");
-    }
+    if(game!=="running"||health>0||modifiers.noFail)return;
+    const animationId=requestAnimationFrame(()=>{freezeTimeRef.current=(performance.now()-startRef.current)/1000;gameActiveRef.current=false;setRunOutcome("failed");setFinalStats({...statsRef.current});setLastJudgement("DESYNC");setTimingMs(null);setStatus("SIGNAL COLLAPSE");setGame("failing")});
+    return()=>cancelAnimationFrame(animationId);
   },[game,health,modifiers.noFail]);
 
   useEffect(()=>{
     if(game!=="failing")return;
     const started=performance.now();let animationId=0;
-    const collapse=()=>{const progress=clamp((performance.now()-started)/2500,0,1);playbackSpeedRef.current=Math.pow(1-progress,2);const audio=audioRef.current;if(audio){audio.filter.frequency.setTargetAtTime(90+Math.pow(1-progress,2)*19910,audio.ctx.currentTime,.06);audio.gain.gain.setTargetAtTime(Math.max(.015,(1-progress)*volume/100),audio.ctx.currentTime,.08)}if(progress<1)animationId=requestAnimationFrame(collapse);else{stopAudio();setStatus("SIGNAL LOST");setGame("results")}};
+    const collapse=()=>{const progress=clamp((performance.now()-started)/2500,0,1);playbackSpeedRef.current=Math.pow(1-progress,2);const audio=audioRef.current;if(audio){audio.filter.frequency.setTargetAtTime(90+Math.pow(1-progress,2)*19910,audio.ctx.currentTime,.06);audio.gain.gain.setTargetAtTime(Math.max(.015,(1-progress)*volume/100),audio.ctx.currentTime,.08)}if(progress<1)animationId=requestAnimationFrame(collapse);else finishRun("failed")};
     animationId=requestAnimationFrame(collapse);return()=>cancelAnimationFrame(animationId);
-  },[game,stopAudio,volume]);
+  },[game,finishRun,volume]);
 
   useEffect(() => {
     const canvas = canvasRef.current; if (!canvas) return;
@@ -435,7 +482,7 @@ export default function Home() {
       }
       ctx.save(); ctx.globalCompositeOperation="lighter";const visualGain=clamp(energy*4+peak*.45,0,1);
       const bars=48; for(let i=0;i<bars;i++){const amp=Math.abs(wave[(i*2)%wave.length]);const bh=(.015+amp*.75+energy*.18)*h*(inGame?.34:.22)*(1+pulse*.72);const x=i/(bars-1)*w;ctx.globalAlpha=visualGain*(.1+amp*.55+pulse*.12);ctx.fillStyle=track.color;ctx.fillRect(x-w/bars*.28,h*.54-bh/2,w/bars*.56,bh)}
-      for(let layer=0;layer<3;layer++){ctx.beginPath();for(let i=0;i<wave.length;i++){const x=i/(wave.length-1)*w;const y=h*.54+wave[i]*h*(.10+layer*.055)*(1+pulse*.38);i?ctx.lineTo(x,y):ctx.moveTo(x,y)}ctx.globalAlpha=visualGain*(.55-layer*.15);ctx.strokeStyle=track.color;ctx.lineWidth=layer===0?2+pulse*2:1;ctx.shadowBlur=20+pulse*24;ctx.shadowColor=track.color;ctx.stroke()}
+      for(let layer=0;layer<3;layer++){ctx.beginPath();for(let i=0;i<wave.length;i++){const x=i/(wave.length-1)*w;const y=h*.54+wave[i]*h*(.10+layer*.055)*(1+pulse*.38);if(i)ctx.lineTo(x,y);else ctx.moveTo(x,y)}ctx.globalAlpha=visualGain*(.55-layer*.15);ctx.strokeStyle=track.color;ctx.lineWidth=layer===0?2+pulse*2:1;ctx.shadowBlur=20+pulse*24;ctx.shadowColor=track.color;ctx.stroke()}
       ctx.shadowBlur=0; for(let ring=0;ring<6;ring++){const limit=Math.min(w,h)*.7;const r=(frame*(1.1+energy*3)+ring*limit/6)%limit;ctx.beginPath();ctx.arc(w/2,h*.54,r,0,Math.PI*2);ctx.globalAlpha=visualGain*(1-r/limit)*(.22+energy*.28);ctx.strokeStyle=track.color;ctx.lineWidth=1+energy*2;ctx.stroke()}
       if(inGame){
         particlesRef.current=particlesRef.current.filter(p=>p.life>0);
@@ -447,14 +494,15 @@ export default function Home() {
 
   useEffect(() => () => stopAudio(), [stopAudio]);
 
-  const timeline = useMemo(() => game === "running" ? (performance.now() - startRef.current) / 1000 : freezeTimeRef.current, [game, notes]);
+  const finalAccuracy = accuracyOf(finalStats);
+  const finalRank = rankOf(finalStats,modifiers.auto);
 
   return (
     <main style={{ "--accent": track.color } as React.CSSProperties}>
       <header className="topbar"><div className="brand"><span>F//B</span><b>FORMULA BEAT</b></div><div className="signal"><i className={audioOn&&game!=="paused"&&game!=="countdown" ? "live" : ""}/>{status}</div><div className="edition">EXPERIMENTAL BUILD · 001</div></header>
 
       {game === "setup" && <section className="setup-shell">
-        <div className="intro"><p className="eyebrow">BYTEBEAT RHYTHM SYSTEM</p><h1>TURN CODE<br/><em>INTO RHYTHM.</em></h1><p className="lead">Каждая формула — одновременно музыка, визуальная система и новая игровая карта.</p></div>
+        <div className="intro"><p className="eyebrow">FUNCBEAT RHYTHM SYSTEM</p><h1>TURN CODE<br/><em>INTO RHYTHM.</em></h1><p className="lead">Каждая формула — одновременно музыка, визуальная система и новая игровая карта.</p></div>
         <div className="track-panel">
           <div className="panel-title"><span>01</span><div><b>SELECT SIGNAL</b><small>{TRACKS.length} FORMULAS LOADED</small></div></div>
           <div className="track-list">{TRACKS.map((item,i)=><button key={item.name} onClick={()=>chooseTrack(i)} className={i===trackIndex?"selected":""}><span className="num">0{i+1}</span><div><b>{item.name}</b><small>{item.blurb} · {item.mode}</small></div><span className="bpm">{item.bpm}<small>BPM</small></span></button>)}</div>
@@ -462,7 +510,7 @@ export default function Home() {
         <div className="visual-card"><canvas ref={canvasRef}/><div className="visual-label"><span>LIVE SIGNAL</span><b>{track.name}</b></div><div className="reticle">+</div></div>
         <div className="config-panel">
           <div className="panel-title"><span>02</span><div><b>CALIBRATE</b><small>GAMEPLAY RESPONSE</small></div></div>
-          <label>SIGNAL MODE <span>{signalMode.toUpperCase()}</span></label><div className="mode-tabs">{(["bytebeat","signed","floatbeat","funcbeat"] as SignalMode[]).map(mode=><button key={mode} onClick={()=>{setSignalMode(mode);schedulePreview(formula,{mode})}} className={signalMode===mode?"on":""}>{mode === "signed" ? "SIGNED 8-BIT" : mode.toUpperCase()}</button>)}</div>
+          <label>SIGNAL MODE <span>{signalMode.toUpperCase()}</span></label><div className="mode-tabs">{(["funcbeat","floatbeat","bytebeat","signed"] as SignalMode[]).map(mode=><button key={mode} onClick={()=>{setSignalMode(mode);schedulePreview(formula,{mode})}} className={signalMode===mode?"on":""}>{mode === "signed" ? "SIGNED 8-BIT" : mode.toUpperCase()}</button>)}</div>
           <div className="parameter-grid">
             <label><span>FORMULA Hz</span><input aria-label="Formula sample rate in hertz" type="number" min="1000" max="96000" step="100" value={formulaHz} onChange={e=>{const hz=clamp(+e.target.value||1000,1000,96000);setFormulaHz(hz);schedulePreview(formula,{hz})}}/></label>
             <label><span>n VALUE</span><input aria-label="Formula n value" type="number" min="-16" max="16" step="0.05" value={nValue} onChange={e=>{const n=clamp(+e.target.value||0,-16,16);setNValue(n);schedulePreview(formula,{n})}}/></label>
@@ -477,7 +525,7 @@ export default function Home() {
             <button className={modifiers.hidden?"on":""} onClick={()=>setModifiers(m=>({...m,hidden:!m.hidden}))}><b>HD</b><span>HIDDEN</span><small>FADE NOTES</small></button>
           </div>
           <label>SIGNAL SENSITIVITY <span>{sensitivity}%</span></label><input type="range" min="30" max="90" value={sensitivity} onChange={e=>setSensitivity(+e.target.value)}/>
-          <button className="preview-button" onClick={()=>audioRef.current?.kind === "preview" ? stopAudio() : void startAudio("preview")}>{audioRef.current?.kind === "preview" ? "■ STOP PREVIEW" : "▶ QUIET PREVIEW"}</button>
+          <button className="preview-button" onClick={()=>audioKind === "preview" ? stopAudio() : void startAudio("preview")}>{audioKind === "preview" ? "■ STOP PREVIEW" : "▶ QUIET PREVIEW"}</button>
           <button className="launch" onClick={launch}><span>INITIALIZE RUN</span><b>↗</b></button><p className="hint">KEYS&nbsp; D · F · J · K &nbsp;/&nbsp; TOUCH</p>
         </div>
         <details className="formula-panel"><summary><span>03</span><b>FORMULA SOURCE</b><small>EDIT / PASTE BYTEBEAT</small></summary><textarea spellCheck={false} value={formula} onChange={e=>{const value=e.target.value;setFormula(value);setStatus("COMPILING PREVIEW");schedulePreview(value)}}/><div className="mode-help"><b>{signalMode.toUpperCase()}</b><span>{signalMode === "bytebeat" ? "0…255 → преобразуется в −1…1" : signalMode === "signed" ? "−128…127 → преобразуется в −1…1" : signalMode === "funcbeat" ? "function(time, sampleRate, n) или stateful-выражение; формат определяется автоматически" : "готовый сигнал −1…1 без 8-битного преобразования"}</span></div><div className="editor-foot"><span>{signalMode==="funcbeat"?"AUTO PROGRAM / EXPRESSION · NATIVE RATE · STEREO":"JS EXPRESSION · t, sr, n AVAILABLE · DEBUG THROW SAFE"}</span><button onClick={()=>void startAudio("preview")}>CHECK + PREVIEW</button></div></details>
@@ -485,13 +533,13 @@ export default function Home() {
 
       {game !== "setup" && <section className={`game-shell ${game} ${modifiers.hidden?"hidden-mod":""}`}>
         <canvas ref={canvasRef} className="game-bg"/>
-        <div className="game-hud"><div><small>SCORE</small><b>{score.toString().padStart(7,"0")}</b></div><div className="now-playing"><i/><span>{track.name}<small>{track.bpm} BPM · {signalMode.toUpperCase()} · {formulaHz} Hz · n {nValue}{modifiers.auto?" · AUTOBOT":""}</small></span></div><div className="hp"><small>SYNC</small><span><i style={{width:`${health}%`}}/></span></div></div>
+        <div className="game-hud"><div><small>SCORE</small><b>{score.toString().padStart(7,"0")}</b></div><div className="now-playing"><i/><span>{track.name}<small>{track.bpm} BPM · {signalMode.toUpperCase()} · {formulaHz} Hz · {activeDuration?`${formatTime(timeline)} / ${formatTime(activeDuration)}`:"ENDLESS"}{modifiers.auto?" · AUTOBOT":""}</small></span></div><div className="hp"><small>SYNC</small><span><i style={{width:`${health}%`}}/></span></div></div>
         <div className="highway"><div className="hit-guide"><span>HIT ZONE</span><small>PERFECT ±{Math.round(TIMING_WINDOWS[difficulty-1].perfect*1000)} ms</small></div>{LANES.map((key,lane)=><button key={key} onPointerDown={e=>{e.currentTarget.setPointerCapture(e.pointerId);pressLane(lane)}} onPointerUp={()=>releaseLane(lane)} onPointerCancel={()=>releaseLane(lane)} className={`lane ${pressedLanes[lane]?"pressed":""}`}><span className="rail"/><b>{key}</b>{notes.filter(n=>n.lane===lane).map(n=>{const travel=1-(n.hitAt-timeline)/1.6;const p=clamp(travel,-.15,1+n.duration/1.6+.2);const hiddenOpacity=modifiers.hidden?clamp((.78-travel)/.3,0,1):undefined;return <i key={n.id} className={`note ${n.kind} ${n.pressed?"holding":""} ${n.hit?"hit":""} ${n.missed?"missed":""}`} style={{top:`${p*JUDGE_POSITION}%`,height:n.kind==="hold"?`${Math.max(10,n.duration/1.6*JUDGE_POSITION)}%`:undefined,opacity:hiddenOpacity}}/>})}</button>)}</div>
         <div className={`judgement ${lastJudgement.toLowerCase()}`}>{lastJudgement}<small>{timingMs!==null?`${timingMs>0?"+":""}${timingMs} ms`:combo>1?`${combo}× COMBO`:""}</small></div>
         <button className="exit" onClick={()=>{if(game==="running"||game==="paused")togglePause();else{stopAudio();setGame("setup");setStatus("FORMULA READY")}}}>{game==="paused"?"ESC · RESUME":game==="running"?"ESC · PAUSE":"ESC · ABORT"}</button>
         {game === "countdown" && <div className="countdown-overlay"><small>CALIBRATING PLAYFIELD</small><b key={countdown}>{countdown}</b><span>GET READY</span></div>}
         {game === "paused" && <div className="pause-overlay"><p>SIGNAL FROZEN</p><h2>PAUSED</h2><small>THE AUDIO AND NOTE TIMELINE ARE LOCKED</small><button className="retry-primary" onClick={togglePause}>RESUME SIGNAL <b>▶</b></button><button className="retry-secondary" onClick={()=>{stopAudio();setGame("setup");setStatus("FORMULA READY")}}>RETURN TO SETUP</button></div>}
-        {game === "results" && <div className="retry-overlay"><div className="failure-mark"><i/><i/><i/></div><p>SIGNAL TERMINATED</p><h2>DESYNCHRONIZED</h2><div className="result-readout"><span><small>FINAL SCORE</small><b>{score.toString().padStart(7,"0")}</b></span><span><small>DIFFICULTY</small><b>{["FLOW","PULSE","OVERDRIVE"][difficulty-1]}</b></span><span><small>RUN STATUS</small><b>{modifiers.auto?"AUTOBOT · UNRANKED":"FAILED"}</b></span></div><button className="retry-primary" onClick={launch}>RETRY SIGNAL <b>↻</b></button><button className="retry-secondary" onClick={()=>{setHealth(100);setNotes([]);setGame("setup");setStatus("FORMULA READY")}}>RETURN TO SETUP</button></div>}
+        {game === "results" && <div className={`retry-overlay ${runOutcome}`}><div className="failure-mark"><i/><i/><i/></div><p>{runOutcome==="complete"?"FULL WAVE SYNCHRONIZED":"SIGNAL TERMINATED"}</p><h2>{runOutcome==="complete"?"WAVE CLEARED":"DESYNCHRONIZED"}</h2><div className={`rank-letter rank-${finalRank.toLowerCase()}`}>{finalRank}</div><div className="result-readout"><span><small>FINAL SCORE</small><b>{score.toString().padStart(7,"0")}</b></span><span><small>ACCURACY</small><b>{finalAccuracy.toFixed(2)}%</b></span><span><small>MAX COMBO</small><b>{finalStats.maxCombo}×</b></span><span><small>PERFECT</small><b>{finalStats.perfect}</b></span><span><small>GREAT</small><b>{finalStats.great}</b></span><span><small>GOOD</small><b>{finalStats.good}</b></span><span><small>MISS</small><b>{finalStats.miss}</b></span><span><small>HOLDS CLEARED</small><b>{finalStats.holds}</b></span><span><small>TOTAL NOTES</small><b>{finalStats.total}</b></span></div><button className="retry-primary" onClick={launch}>{runOutcome==="complete"?"PLAY AGAIN":"RETRY SIGNAL"} <b>↻</b></button><button className="retry-secondary" onClick={()=>{setHealth(100);setNotes([]);setGame("setup");setStatus("FORMULA READY")}}>RETURN TO SETUP</button></div>}
       </section>}
     </main>
   );
