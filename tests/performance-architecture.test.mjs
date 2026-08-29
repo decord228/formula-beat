@@ -10,23 +10,27 @@ test("gameplay motion is refresh-rate driven without per-frame React renders", a
   assert.match(source, /if\(uiDirty\)setNotes\(\[\.\.\.notesRef\.current\]\)/);
 });
 
-test("reactive background uses an adaptive music-driven 3D stage", async () => {
+test("reactive background uses a persistent adaptive music-driven 3D stage", async () => {
   const [source, styles] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
   ]);
-  assert.match(source, /getContext\("webgl"/);
-  assert.match(source, /powerPreference:"high-performance"/);
+  assert.match(source, /getContext\("2d",\{alpha:false,desynchronized:true\}/);
   assert.match(source, /quality=average>20/);
-  assert.match(source, /alpha:true/);
-  assert.match(source, /uniform float waveform\[16\]/);
-  assert.match(source, /float cubeWire/);
-  assert.match(source, /float octaWire/);
-  assert.match(source, /float floorZ=1\.\/floorDepth\+travel\*11\./);
-  assert.match(source, /gl\.uniform1fv\(waveformUniform,visualWave\)/);
+  assert.match(source, /const cubePoints/);
+  assert.match(source, /const octaPoints/);
+  assert.match(source, /const drawShape=/);
+  assert.match(source, /const visualWave=new Float32Array\(16\)/);
+  assert.match(source, /stageMode==="game"\?1000\/90:0/);
+  assert.match(source, /quality=stageMode==="setup"\?\.92:\.64/);
+  assert.match(source, /const gridRows=stageMode==="setup"\?18:12/);
+  assert.match(source, /const shapeCount=stageMode==="setup"\?6:4/);
+  assert.match(source, /pitchFrame\+\+%6===0/);
+  assert.match(source, /useEffect\(\(\)=>\{trackColorRef\.current=track\.color\},\[track\.color\]\)/);
+  assert.match(source, /\}, \[stageMode\]\);/);
   assert.match(source, /signal\.onset\*4\.2\+signal\.flux\*1\.4/);
   assert.match(source, /signal\.pitchConfidence/);
-  assert.doesNotMatch(source, /nebula|farDust|pulseRing|coreRadius|float shell=/);
+  assert.doesNotMatch(source, /createShader|compile\(gl\.|nebula|farDust|pulseRing/);
   assert.match(styles, /\.game-bg\{opacity:\.82;filter:saturate\(1\.18\)/);
   assert.match(styles, /translate3d\(0,calc\(var\(--note-y/);
 });

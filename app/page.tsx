@@ -65,7 +65,7 @@ const rankOf = (stats: RunStats, auto: boolean) => {
 };
 
 function detectPitch(samples: Float32Array, sampleRate: number) {
-  const stride = 4;
+  const stride = 8;
   let rms = 0;
   for (let i = 0; i < samples.length; i += stride) rms += samples[i] * samples[i];
   rms = Math.sqrt(rms / Math.ceil(samples.length / stride));
@@ -135,7 +135,11 @@ export default function Home() {
   const freezeTimeRef = useRef(0);
   const statsRef = useRef<RunStats>({...EMPTY_STATS});
   const track = TRACKS[trackIndex];
+  const trackColorRef = useRef(track.color);
+  const stageMode = game === "setup" ? "setup" : "game";
   const activeDuration = formula === track.formula ? track.duration : 0;
+
+  useEffect(()=>{trackColorRef.current=track.color},[track.color]);
 
   const stopAudio = useCallback(() => {
     audioRequestRef.current+=1;
@@ -236,7 +240,7 @@ export default function Home() {
       const onsetScore = Math.max(0, blockEnergy - previousEnergy) * 1.65 + Math.max(0, peak - previousPeak) * .22 + Math.max(0, blockFlux - adaptiveFlux) * .85;
       const relativeEnergy = blockEnergy / Math.max(.025, adaptiveEnergy);
       const rawIntensity = clamp((relativeEnergy - .55) * .62 + onsetScore * 3.2 + peak * .14, 0, 1);
-      if(kind==="game"&&pitchFrame++%2===0)pitch=detectPitch(analysisMono,ctx.sampleRate);
+      if(kind==="game"&&pitchFrame++%6===0)pitch=detectPitch(analysisMono,ctx.sampleRate);
       spectrumRef.current.energy = blockEnergy;
       spectrumRef.current.peak = peak;
       spectrumRef.current.flux = blockFlux;
@@ -500,62 +504,27 @@ export default function Home() {
   },[game,finishRun,volume]);
 
   useEffect(() => {
-    const canvas = canvasRef.current; if (!canvas) return;
-    const gl=canvas.getContext("webgl",{alpha:true,antialias:false,depth:false,stencil:false,powerPreference:"high-performance"});if(!gl)return;
-    const vertexSource=`attribute vec2 p;void main(){gl_Position=vec4(p,0.,1.);}`;
-    const fragmentSource=`precision mediump float;
-    uniform vec2 resolution;uniform float time;uniform float travel;uniform float energy;uniform float beat;uniform float intensity;uniform float transient;uniform float pitch;uniform float gameMode;uniform vec3 accent;uniform float waveform[16];
-    float hash(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
-    mat2 rot(float a){float s=sin(a),c=cos(a);return mat2(c,-s,s,c);}
-    float segment(vec2 p,vec2 a,vec2 b){vec2 pa=p-a,ba=b-a;float h=clamp(dot(pa,ba)/dot(ba,ba),0.,1.);return length(pa-ba*h);}
-    float cubeWire(vec2 q){
-      vec2 shift=vec2(.34,-.28);float d=abs(max(abs(q.x),abs(q.y))-1.);vec2 rear=q-shift;
-      d=min(d,abs(max(abs(rear.x),abs(rear.y))-.68));
-      d=min(d,segment(q,vec2(-1.,-1.),vec2(-.68,-.68)+shift));d=min(d,segment(q,vec2(1.,-1.),vec2(.68,-.68)+shift));
-      d=min(d,segment(q,vec2(-1.,1.),vec2(-.68,.68)+shift));d=min(d,segment(q,vec2(1.,1.),vec2(.68,.68)+shift));return d;
-    }
-    float octaWire(vec2 q){float d=abs(abs(q.x)+abs(q.y)-1.);d=min(d,segment(q,vec2(-1.,0.),vec2(1.,0.)));d=min(d,segment(q,vec2(0.,-1.),vec2(0.,1.)));return d;}
-    void main(){
-      vec2 p=(gl_FragCoord.xy*2.-resolution)/resolution.y;float drive=clamp(.12+energy*.62+intensity*.54,0.,1.);float hit=clamp(beat*.9+transient*.72,0.,1.);
-      float horizon=.18;vec3 ice=mix(accent,vec3(.44,.88,1.),.4);vec3 hot=mix(accent,vec3(1.,.16,.72),.34);vec3 col=vec3(.004,.009,.012);
+    const canvas=canvasRef.current;if(!canvas)return;
+    const ctx=canvas.getContext("2d",{alpha:false,desynchronized:true});if(!ctx)return;
+    const visualWave=new Float32Array(16);let animationId=0,lastFrame=0,lastPaint=0,sampleTime=0,sampleFrames=0,quality=stageMode==="setup"?.92:.64,travel=0,visualEnergy=0,visualBeat=0,visualIntensity=0,visualTransient=0,visualPitch=.5;
+    const rgba=(hex:string,alpha:number)=>{const [r,g,b]=colorChannels(hex).map(value=>Math.round(value*255));return `rgba(${r},${g},${b},${alpha})`};
+    const rotatePoint=(point:[number,number,number],yaw:number,pitchAngle:number)=>{const [x,y,z]=point,cy=Math.cos(yaw),sy=Math.sin(yaw),cx=Math.cos(pitchAngle),sx=Math.sin(pitchAngle),rx=x*cy-z*sy,rz=x*sy+z*cy;return [rx,y*cx-rz*sx,y*sx+rz*cx] as [number,number,number]};
+    const cubePoints:[number,number,number][]=Array.from({length:8},(_,i)=>[i&1?1:-1,i&2?1:-1,i&4?1:-1]);
+    const cubeEdges=[[0,1],[0,2],[0,4],[1,3],[1,5],[2,3],[2,6],[3,7],[4,5],[4,6],[5,7],[6,7]];
+    const octaPoints:[number,number,number][]=[[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
+    const octaEdges=[[0,2],[0,3],[0,4],[0,5],[1,2],[1,3],[1,4],[1,5],[2,4],[2,5],[3,4],[3,5]];
+    const drawShape=(cx:number,cy:number,size:number,yaw:number,pitchAngle:number,octa:boolean,color:string,alpha:number)=>{const points=octa?octaPoints:cubePoints,edges=octa?octaEdges:cubeEdges,projected=points.map(point=>{const [x,y,z]=rotatePoint(point,yaw,pitchAngle),perspective=3/(3.4+z);return [cx+x*size*perspective,cy+y*size*perspective]});ctx.beginPath();for(const [a,b] of edges){ctx.moveTo(projected[a][0],projected[a][1]);ctx.lineTo(projected[b][0],projected[b][1])}ctx.strokeStyle=rgba(color,alpha);if(stageMode==="setup"){ctx.shadowColor=color;ctx.shadowBlur=Math.min(20,size*.2)}ctx.stroke();ctx.shadowBlur=0};
+    const draw=(now:number)=>{const frameInterval=stageMode==="game"?1000/90:0;if(now-lastPaint<frameInterval){animationId=requestAnimationFrame(draw);return}lastPaint=now;const rect=canvas.getBoundingClientRect(),delta=lastFrame?Math.min(50,now-lastFrame):0;lastFrame=now;if(delta>0){sampleTime+=delta;sampleFrames++}if(sampleFrames>=120){const average=sampleTime/sampleFrames,maxQuality=stageMode==="setup"?.92:.64,minQuality=stageMode==="setup"?.58:.46;quality=average>20?Math.max(minQuality,quality-.08):average<11?Math.min(maxQuality,quality+.04):quality;sampleTime=0;sampleFrames=0}const ratio=Math.min(devicePixelRatio,1.25)*quality,width=Math.max(2,Math.round(rect.width*ratio)),height=Math.max(2,Math.round(rect.height*ratio));if(canvas.width!==width||canvas.height!==height){canvas.width=width;canvas.height=height}ctx.setTransform(ratio,0,0,ratio,0,0);const w=rect.width,h=rect.height,horizon=h*.36,signal=spectrumRef.current,active=stageMode==="setup"||gameActiveRef.current;signal.beatPulse*=active?.88:.72;const targetEnergy=active?clamp(signal.energy*2.3+signal.peak*.28,0,1):0,targetIntensity=active?clamp(signal.intensity,0,1):0,targetTransient=active?clamp(signal.onset*4.2+signal.flux*1.4,0,1):0,targetPitch=active&&signal.pitchConfidence>.35?((signal.pitch%12)+12)%12/12:.5;visualEnergy+=(targetEnergy-visualEnergy)*.08;visualIntensity+=(targetIntensity-visualIntensity)*.055;visualTransient+=(targetTransient-visualTransient)*(targetTransient>visualTransient?.28:.075);visualBeat+=(signal.beatPulse-visualBeat)*(signal.beatPulse>visualBeat?.34:.1);visualPitch+=(targetPitch-visualPitch)*.025;for(let i=0;i<16;i++){const sample=Math.abs(signal.wave[(i*7+3)%signal.wave.length]);visualWave[i]+=(clamp(sample*1.7,0,1)-visualWave[i])*(sample>visualWave[i]?.32:.12)}travel=(travel+delta*.001*(.16+visualIntensity*.34+visualBeat*.13))%100;const accent=trackColorRef.current,drive=clamp(.16+visualEnergy*.62+visualIntensity*.54,0,1),hit=clamp(visualBeat*.9+visualTransient*.72,0,1),vanishX=w*(.5+(visualPitch-.5)*.04);
+      ctx.globalCompositeOperation="source-over";ctx.fillStyle="#030706";ctx.fillRect(0,0,w,h);const sky=ctx.createRadialGradient(vanishX,horizon,0,vanishX,horizon,Math.max(w,h)*.72);sky.addColorStop(0,rgba(accent,.12+drive*.06));sky.addColorStop(.42,"rgba(4,13,14,.78)");sky.addColorStop(1,"#020403");ctx.fillStyle=sky;ctx.fillRect(0,0,w,h);
+      ctx.globalCompositeOperation="lighter";ctx.lineWidth=1;ctx.strokeStyle=rgba(accent,.12+drive*.16);ctx.shadowColor=accent;ctx.shadowBlur=stageMode==="setup"?6+drive*7:0;for(let i=-8;i<=8;i++){ctx.beginPath();ctx.moveTo(vanishX,horizon);ctx.lineTo(vanishX+i*w*.1,h);ctx.stroke()}const gridRows=stageMode==="setup"?18:12;for(let i=0;i<gridRows;i++){const phase=(i/gridRows+travel*.24)%1,y=horizon+phase*phase*(h-horizon)*1.12;ctx.beginPath();for(let j=0;j<=10;j++){const x=j/10*w,wave=Math.sin(j*.72+travel*3.2+phase*5.)*(3+visualEnergy*11)*phase;if(j===0)ctx.moveTo(x,y+wave);else ctx.lineTo(x,y+wave)}ctx.globalAlpha=.18+phase*.5;ctx.stroke()}ctx.globalAlpha=1;ctx.shadowBlur=0;
+      const scanPhase=(travel*.58)%1,scanY=horizon+scanPhase*scanPhase*(h-horizon);ctx.strokeStyle=rgba("#ff4fd8",.12+hit*.58);ctx.shadowColor="#ff4fd8";ctx.shadowBlur=stageMode==="setup"?12+hit*18:0;ctx.lineWidth=1+hit*2;ctx.beginPath();ctx.moveTo(0,scanY);ctx.lineTo(w,scanY);ctx.stroke();ctx.shadowBlur=0;
+      const barWidth=Math.max(3,w*.018),barGap=w*.006,total=16*barWidth+15*barGap,startX=(w-total)/2;for(let i=0;i<16;i++){const amp=10+visualWave[i]*(h*.16+visualEnergy*h*.12)+visualIntensity*h*.035,x=startX+i*(barWidth+barGap),barColor=i<8?accent:"#ff4fd8";ctx.fillStyle=rgba(barColor,.28+drive*.42);if(stageMode==="setup"){ctx.shadowColor=barColor;ctx.shadowBlur=5+drive*7}ctx.fillRect(x,horizon-amp,barWidth,amp)}ctx.shadowBlur=0;
+      const shapeCount=stageMode==="setup"?6:4;for(let i=0;i<shapeCount;i++){const phase=(i/shapeCount+travel*.2)%1,side=i%2?-1:1,size=(18+phase*phase*95)*(1+hit*.28),cx=vanishX+side*(w*.12+phase*w*.39),cy=horizon+Math.pow(phase,1.7)*h*.54+Math.sin(now*.00045+i*1.9)*8,fade=Math.sin(Math.PI*phase),shapeColor=i%3===0?"#ff4fd8":accent;ctx.lineWidth=1+phase*1.6;drawShape(cx,cy,size,now*.00028*(1+i*.08)+i+visualPitch*2.4,now*.00019+i*.43,i%2===0,shapeColor,(.28+drive*.52+hit*.38)*fade)}
+      ctx.globalCompositeOperation="source-over";const vignette=ctx.createRadialGradient(w*.5,h*.5,Math.min(w,h)*.18,w*.5,h*.5,Math.max(w,h)*.72);vignette.addColorStop(.45,"rgba(0,0,0,0)");vignette.addColorStop(1,"rgba(0,0,0,.7)");ctx.fillStyle=vignette;ctx.fillRect(0,0,w,h);animationId=requestAnimationFrame(draw)};
+    animationId=requestAnimationFrame(draw);return()=>cancelAnimationFrame(animationId);
+  }, [stageMode]);
 
-      float skyFade=clamp((p.y-horizon)*.72+.3,0.,1.);col+=mix(accent,ice,.55)*skyFade*(.012+energy*.025);
-      float floorDepth=max(.025,horizon-p.y);float floorMask=1.-smoothstep(horizon-.01,horizon+.025,p.y);
-      float floorX=p.x/floorDepth;float floorZ=1./floorDepth+travel*11.;floorZ+=sin(floorX*.58+time*.45)*(.08+energy*.2);
-      float gx=abs(fract(floorX*.29)-.5),gz=abs(fract(floorZ*.075)-.5);float grid=exp(-min(gx,gz)*72.);
-      float lane=exp(-abs(abs(floorX)-1.7)*8.)+exp(-abs(abs(floorX)-3.4)*7.);float distanceFade=smoothstep(.03,.23,floorDepth)*(1.-smoothstep(1.25,1.9,floorDepth));
-      col+=ice*(grid*.34+lane*.18)*floorMask*distanceFade*(.34+drive*.72);
-      float scan=exp(-abs(fract(floorZ*.035-travel*.7)-.5)*42.);col+=hot*scan*floorMask*distanceFade*(.04+hit*.34);
-
-      for(int i=0;i<16;i++){
-        float fi=float(i),x=(fi-7.5)*.115;float amp=.035+waveform[i]*(.16+energy*.28)+intensity*.07;vec2 bp=vec2(abs(p.x-x)-.038,abs(p.y-(horizon+amp*.5))-amp*.5);
-        float box=max(bp.x,bp.y);float solid=1.-smoothstep(-.004,.008,box);float glow=exp(-max(box,0.)*45.)*.18;vec3 barColor=mix(accent,ice,fi/15.);
-        col+=barColor*(solid*.34+glow)*(.52+drive*.75);
-      }
-
-      for(int i=0;i<6;i++){
-        float fi=float(i),phase=fract(fi/6.+travel*.19),z=mix(7.2,.82,phase);float seed=hash(vec2(fi,4.7));float side=mix(-1.,1.,step(1.,mod(fi,2.)));
-        float worldX=side*(1.35+seed*1.25);vec2 center=vec2(worldX/z,horizon+(-.04+sin(time*.42+fi*1.7)*.24)/z);
-        float size=(.28+seed*.18)*(1.+hit*.42)/z;vec2 q=rot(time*(.2+seed*.32)+fi+(pitch-.5)*3.2)*(p-center)/max(size,.018);
-        float cube=cubeWire(q),octa=octaWire(q);float d=mix(cube,octa,step(.52,seed));float wire=exp(-d*58.),glow=exp(-d*10.)*.16;
-        float fade=smoothstep(.02,.18,phase)*(1.-smoothstep(.88,1.,phase));vec3 shapeColor=mix(hot,ice,seed);
-        col+=shapeColor*(wire+glow)*fade*(.48+drive*.88+hit*.65);
-      }
-
-      float horizonLine=exp(-abs(p.y-horizon)*75.);col+=mix(accent,ice,.5)*horizonLine*(.2+energy*.35);
-      float centerPulse=exp(-length(vec2(p.x*.75,p.y-horizon))*3.8);col+=accent*centerPulse*(.025+hit*.11)*gameMode;
-      float vignette=1.-smoothstep(.35,1.65,length(p*vec2(.62,.88)));col*=.68+vignette*.62;col=pow(col,vec3(.82));gl_FragColor=vec4(col,1.);
-    }`;
-    const compile=(type:number,source:string)=>{const shader=gl.createShader(type);if(!shader)return null;gl.shaderSource(shader,source);gl.compileShader(shader);if(!gl.getShaderParameter(shader,gl.COMPILE_STATUS)){gl.deleteShader(shader);return null}return shader};
-    const vertex=compile(gl.VERTEX_SHADER,vertexSource),fragment=compile(gl.FRAGMENT_SHADER,fragmentSource);if(!vertex||!fragment)return;const program=gl.createProgram();if(!program)return;gl.attachShader(program,vertex);gl.attachShader(program,fragment);gl.linkProgram(program);if(!gl.getProgramParameter(program,gl.LINK_STATUS))return;
-    const buffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,buffer);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,-1,1,1,-1,1,1]),gl.STATIC_DRAW);gl.useProgram(program);const position=gl.getAttribLocation(program,"p");gl.enableVertexAttribArray(position);gl.vertexAttribPointer(position,2,gl.FLOAT,false,0,0);
-    const resolution=gl.getUniformLocation(program,"resolution"),clock=gl.getUniformLocation(program,"time"),travelUniform=gl.getUniformLocation(program,"travel"),energyUniform=gl.getUniformLocation(program,"energy"),beatUniform=gl.getUniformLocation(program,"beat"),intensityUniform=gl.getUniformLocation(program,"intensity"),transientUniform=gl.getUniformLocation(program,"transient"),pitchUniform=gl.getUniformLocation(program,"pitch"),modeUniform=gl.getUniformLocation(program,"gameMode"),accentUniform=gl.getUniformLocation(program,"accent"),waveformUniform=gl.getUniformLocation(program,"waveform[0]");const [red,green,blue]=colorChannels(track.color);gl.uniform3f(accentUniform,red,green,blue);gl.uniform1f(modeUniform,game==="setup"?0:1);
-    const visualWave=new Float32Array(16);let animationId=0,quality=game==="setup"?.92:.8,lastFrame=0,sampleTime=0,sampleFrames=0,spaceTravel=0,visualEnergy=0,visualBeat=0,visualIntensity=0,visualTransient=0,visualPitch=.5;const resize=()=>{const rect=canvas.getBoundingClientRect(),ratio=Math.min(devicePixelRatio,1.25)*quality,width=Math.max(2,Math.round(rect.width*ratio)),height=Math.max(2,Math.round(rect.height*ratio));if(canvas.width!==width||canvas.height!==height){canvas.width=width;canvas.height=height;gl.viewport(0,0,width,height);gl.uniform2f(resolution,width,height)}};
-    const draw=(now:number)=>{resize();const delta=lastFrame?now-lastFrame:0;lastFrame=now;if(delta>0&&delta<100){sampleTime+=delta;sampleFrames++}if(sampleFrames>=120){const average=sampleTime/sampleFrames;quality=average>20?Math.max(.56,quality-.1):average<11?Math.min(game==="setup"?.92:.8,quality+.05):quality;sampleTime=0;sampleFrames=0}const signal=spectrumRef.current;const active=game==="setup"||game==="running"||game==="failing";signal.beatPulse*=active?.88:.72;const targetEnergy=active?clamp(signal.energy*2.3+signal.peak*.28,0,1):0,targetIntensity=active?clamp(signal.intensity,0,1):0,targetTransient=active?clamp(signal.onset*4.2+signal.flux*1.4,0,1):0,targetPitch=active&&signal.pitchConfidence>.35?((signal.pitch%12)+12)%12/12:.5;visualEnergy+=(targetEnergy-visualEnergy)*.08;visualIntensity+=(targetIntensity-visualIntensity)*.055;visualTransient+=(targetTransient-visualTransient)*(targetTransient>visualTransient?.28:.075);visualBeat+=(signal.beatPulse-visualBeat)*(signal.beatPulse>visualBeat?.34:.1);visualPitch+=(targetPitch-visualPitch)*.025;for(let i=0;i<16;i++){const sample=Math.abs(signal.wave[(i*7+3)%signal.wave.length]);visualWave[i]+=(clamp(sample*1.7,0,1)-visualWave[i])*(sample>visualWave[i]?.32:.12)}spaceTravel=(spaceTravel+delta*.001*(.11+visualIntensity*.24+visualBeat*.08))%100;gl.uniform1f(clock,now*.001);gl.uniform1f(travelUniform,spaceTravel);gl.uniform1f(energyUniform,visualEnergy);gl.uniform1f(beatUniform,visualBeat);gl.uniform1f(intensityUniform,visualIntensity);gl.uniform1f(transientUniform,visualTransient);gl.uniform1f(pitchUniform,visualPitch);gl.uniform1fv(waveformUniform,visualWave);gl.drawArrays(gl.TRIANGLES,0,6);animationId=requestAnimationFrame(draw)};
-    animationId=requestAnimationFrame(draw);return()=>{cancelAnimationFrame(animationId);gl.deleteProgram(program);gl.deleteShader(vertex);gl.deleteShader(fragment);gl.deleteBuffer(buffer)};
-  }, [game, track.color]);
-
-  useEffect(()=>{if(game==="setup")return;const canvas=particleCanvasRef.current;if(!canvas)return;const ctx=canvas.getContext("2d",{alpha:true});if(!ctx)return;let animationId=0;const draw=()=>{const rect=canvas.getBoundingClientRect();if(canvas.width!==Math.round(rect.width)||canvas.height!==Math.round(rect.height)){canvas.width=Math.round(rect.width);canvas.height=Math.round(rect.height)}ctx.clearRect(0,0,canvas.width,canvas.height);ctx.globalCompositeOperation="lighter";particlesRef.current=particlesRef.current.filter(p=>p.life>0);for(const p of particlesRef.current){p.x+=p.vx;p.y+=p.vy;p.vy+=.14;p.life-=.025;ctx.globalAlpha=p.life;ctx.fillStyle=track.color;ctx.fillRect(p.x,p.y,p.size,p.size)}ctx.globalAlpha=1;animationId=requestAnimationFrame(draw)};animationId=requestAnimationFrame(draw);return()=>cancelAnimationFrame(animationId)},[game,track.color]);
+  useEffect(()=>{if(game==="setup")return;const canvas=particleCanvasRef.current;if(!canvas)return;const ctx=canvas.getContext("2d",{alpha:true});if(!ctx)return;let animationId=0,lastPaint=0;const draw=(now:number)=>{if(now-lastPaint<1000/90){animationId=requestAnimationFrame(draw);return}lastPaint=now;const rect=canvas.getBoundingClientRect();if(canvas.width!==Math.round(rect.width)||canvas.height!==Math.round(rect.height)){canvas.width=Math.round(rect.width);canvas.height=Math.round(rect.height)}ctx.clearRect(0,0,canvas.width,canvas.height);ctx.globalCompositeOperation="lighter";particlesRef.current=particlesRef.current.filter(p=>p.life>0);for(const p of particlesRef.current){p.x+=p.vx;p.y+=p.vy;p.vy+=.14;p.life-=.025;ctx.globalAlpha=p.life;ctx.fillStyle=track.color;ctx.fillRect(p.x,p.y,p.size,p.size)}ctx.globalAlpha=1;animationId=requestAnimationFrame(draw)};animationId=requestAnimationFrame(draw);return()=>cancelAnimationFrame(animationId)},[game,track.color]);
 
   useEffect(() => () => stopAudio(), [stopAudio]);
 
