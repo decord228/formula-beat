@@ -8,7 +8,6 @@ type Note = { id: number; lane: number; born: number; hitAt: number; kind: "tap"
 type Particle = { x: number; y: number; vx: number; vy: number; life: number; size: number };
 type RhythmEvent = { hitAt: number; lane: number; strength: number; hold: boolean; duration: number; source: "transient" | "melody" };
 type Modifiers = { auto: boolean; noFail: boolean; hidden: boolean };
-type FormulaSample = number | number[];
 type PcmBlock = { left: Float32Array; right: Float32Array };
 
 const TRACKS: Track[] = [
@@ -63,40 +62,6 @@ function detectPitch(samples: Float32Array, sampleRate: number) {
   }
   const frequency = bestLag ? sampleRate / (bestLag * stride) : 0;
   return { midi: frequency ? 69 + 12 * Math.log2(frequency / 440) : 0, confidence: best };
-}
-
-function compileFormula(source: string, mode?: SignalMode) {
-  const cleaned = source.replaceAll("\\*", "*").replaceAll("\\_", "_");
-  const prelude = `
-    const {abs,acos,acosh,asin,asinh,atan,atan2,atanh,cbrt,ceil,cos,cosh,exp,expm1,floor,fround,hypot,imul,log,log10,log1p,log2,max,min,pow,random,round,sign,sin,sinh,sqrt,tan,tanh,trunc,PI,E,LN2,LN10,LOG2E,LOG10E,SQRT1_2,SQRT2}=M;
-    const int=x=>x|0, ln=log;
-  `;
-  const compileProgram = () => {
-    const renderer = new Function("M", `${prelude}${cleaned}`)(Math);
-    if (typeof renderer !== "function") throw new Error("FUNCBEAT MUST RETURN FUNCTION(TIME)");
-    return ((t: number, sr: number, n: number) => renderer(t / sr, sr, n)) as (t: number, sr: number, n: number) => FormulaSample;
-  };
-  if (mode === "funcbeat") return compileProgram();
-  try { return new Function("M", `${prelude}return function(t,sr,n){ return (${cleaned}); };`)(Math) as (t: number, sr: number, n: number) => FormulaSample; }
-  catch { return compileProgram(); }
-}
-
-function evaluateFormula(fn: ReturnType<typeof compileFormula>, t: number, sr: number, n: number, fallback: FormulaSample = 0) {
-  try { return fn(t, sr, n); }
-  catch (value) {
-    // Several classic bytebeat formulas intentionally throw strings as a
-    // debug console (melody/kick/snare readouts). That is metadata, not audio failure.
-    if (typeof value === "string") return fallback;
-    throw value;
-  }
-}
-
-function normalizeSample(value: number, mode: SignalMode) {
-  if (!Number.isFinite(value)) return 0;
-  if (mode === "floatbeat" || mode === "funcbeat") return clamp(value, -1, 1);
-  const integer = Math.floor(value);
-  if (mode === "bytebeat") return ((integer & 255) - 128) / 128;
-  return (((integer + 128) & 255) - 128) / 128;
 }
 
 export default function Home() {
@@ -164,9 +129,6 @@ export default function Home() {
     const hz = override?.hz ?? formulaHz;
     const n = override?.n ?? nValue;
     const outputVolume = override?.volume ?? volume;
-    let fn: ReturnType<typeof compileFormula>;
-    try { fn = compileFormula(source,mode); let testSample: FormulaSample=0; for (let i = 0; i < 32; i++) testSample=evaluateFormula(fn,i * 257,hz,n,testSample); if(mode==="funcbeat")fn=compileFormula(source,mode); }
-    catch { setStatus("FORMULA ERROR"); return false; }
     const contextOptions: AudioContextOptions = { latencyHint: "interactive" };
     if(mode==="funcbeat")contextOptions.sampleRate=clamp(Math.round(hz),8000,96000);
     const ctx = new AudioContext(contextOptions);
@@ -179,16 +141,16 @@ export default function Home() {
     gain.gain.value = clamp(outputVolume / 100, 0, 1.5) * (kind === "preview" ? .22 : 1);
     playbackSpeedRef.current=1;
     const renderWorker=new Worker(new URL("formula-worker.js",document.baseURI),{type:"module"});pendingWorkerRef.current=renderWorker;
-    const sampleQueue:PcmBlock[]=[];let pendingBlocks=0;let resolveReady:()=>void=()=>{};let rejectReady:(error:Error)=>void=()=>{};let resolveFirst:()=>void=()=>{};
+    const sampleQueue:PcmBlock[]=[];let pendingBlocks=0;let workerRuntimeError="";let resolveReady:()=>void=()=>{};let rejectReady:(error:Error)=>void=()=>{};let resolveFirst:()=>void=()=>{};
     const readyPromise=new Promise<void>((resolve,reject)=>{resolveReady=resolve;rejectReady=reject});
     const firstBlockPromise=new Promise<void>(resolve=>{resolveFirst=resolve});
     const targetBlocks=kind==="game"?12:8;
     const requestBlocks=()=>{while(sampleQueue.length+pendingBlocks<targetBlocks){pendingBlocks+=1;renderWorker.postMessage({type:"render",speed:playbackSpeedRef.current})}};
-    renderWorker.onmessage=(event:MessageEvent<{type:string;left?:Float32Array;right?:Float32Array;message?:string}>)=>{const message=event.data;if(message.type==="ready"){resolveReady();return}if(message.type==="compile-error"){rejectReady(new Error(message.message||"formula worker error"));return}if(message.type==="runtime-error"){setStatus(`RUNTIME ERROR: ${(message.message||"UNKNOWN ERROR").toUpperCase().slice(0,48)}`);return}if(message.type==="chunk"&&message.left&&message.right){pendingBlocks=Math.max(0,pendingBlocks-1);sampleQueue.push({left:message.left,right:message.right});resolveFirst()}};
+    renderWorker.onmessage=(event:MessageEvent<{type:string;left?:Float32Array;right?:Float32Array;message?:string}>)=>{const message=event.data;if(message.type==="ready"){resolveReady();return}if(message.type==="compile-error"){rejectReady(new Error(message.message||"formula worker error"));return}if(message.type==="runtime-error"){workerRuntimeError=message.message||"UNKNOWN ERROR";setStatus(`RUNTIME ERROR: ${workerRuntimeError.toUpperCase().slice(0,48)}`);return}if(message.type==="chunk"&&message.left&&message.right){pendingBlocks=Math.max(0,pendingBlocks-1);sampleQueue.push({left:message.left,right:message.right});resolveFirst()}};
     renderWorker.onerror=()=>rejectReady(new Error("formula worker failed"));
     renderWorker.postMessage({type:"init",source,mode,formulaRate:hz,outputRate:ctx.sampleRate,n,chunkSize:processor.bufferSize});
-    try{await Promise.race([readyPromise,new Promise<void>((_,reject)=>setTimeout(()=>reject(new Error("formula worker timeout")),4000))]);requestBlocks();await Promise.race([firstBlockPromise,new Promise<void>((_,reject)=>setTimeout(()=>reject(new Error("audio buffer timeout")),4000))])}
-    catch{renderWorker.terminate();pendingWorkerRef.current=null;void ctx.close();if(audioRequestRef.current===requestId)setStatus("FORMULA WORKER ERROR");return false}
+    try{await Promise.race([readyPromise,new Promise<void>((_,reject)=>setTimeout(()=>reject(new Error("formula worker timeout")),8000))]);requestBlocks();await Promise.race([firstBlockPromise,new Promise<void>((_,reject)=>setTimeout(()=>reject(new Error("audio buffer timeout")),8000))]);if(workerRuntimeError)throw new Error(workerRuntimeError)}
+    catch{renderWorker.terminate();pendingWorkerRef.current=null;void ctx.close();if(audioRequestRef.current===requestId)setStatus(workerRuntimeError?`RUNTIME ERROR: ${workerRuntimeError.toUpperCase().slice(0,48)}`:"FORMULA WORKER ERROR");return false}
     if(audioRequestRef.current!==requestId){renderWorker.terminate();pendingWorkerRef.current=null;void ctx.close();return false}
     let previousMono = 0; let previousEnergy = 0; let previousPeak = 0; let adaptiveFlux = .025; let adaptiveEnergy = 0; let lastOnsetAt = -10; let lastMelodyAt = -10; let eventIndex = 0;let pitchFrame=0;let pitch={midi:0,confidence:0};
     let smoothedPitch = 60; let lastStablePitch = 60;
@@ -518,7 +480,7 @@ export default function Home() {
           <button className="preview-button" onClick={()=>audioRef.current?.kind === "preview" ? stopAudio() : void startAudio("preview")}>{audioRef.current?.kind === "preview" ? "■ STOP PREVIEW" : "▶ QUIET PREVIEW"}</button>
           <button className="launch" onClick={launch}><span>INITIALIZE RUN</span><b>↗</b></button><p className="hint">KEYS&nbsp; D · F · J · K &nbsp;/&nbsp; TOUCH</p>
         </div>
-        <details className="formula-panel"><summary><span>03</span><b>FORMULA SOURCE</b><small>EDIT / PASTE BYTEBEAT</small></summary><textarea spellCheck={false} value={formula} onChange={e=>{const value=e.target.value;setFormula(value);setStatus("COMPILING PREVIEW");schedulePreview(value)}}/><div className="mode-help"><b>{signalMode.toUpperCase()}</b><span>{signalMode === "bytebeat" ? "0…255 → преобразуется в −1…1" : signalMode === "signed" ? "−128…127 → преобразуется в −1…1" : signalMode === "funcbeat" ? "JS-программа должна вернуть function(time, sampleRate, n), time — секунды" : "готовый сигнал −1…1 без 8-битного преобразования"}</span></div><div className="editor-foot"><span>{signalMode==="funcbeat"?"STATEFUL PROGRAM · NATIVE SAMPLE RATE · FULL STEREO":"JS EXPRESSION · t, sr, n AVAILABLE · DEBUG THROW SAFE"}</span><button onClick={()=>void startAudio("preview")}>CHECK + PREVIEW</button></div></details>
+        <details className="formula-panel"><summary><span>03</span><b>FORMULA SOURCE</b><small>EDIT / PASTE BYTEBEAT</small></summary><textarea spellCheck={false} value={formula} onChange={e=>{const value=e.target.value;setFormula(value);setStatus("COMPILING PREVIEW");schedulePreview(value)}}/><div className="mode-help"><b>{signalMode.toUpperCase()}</b><span>{signalMode === "bytebeat" ? "0…255 → преобразуется в −1…1" : signalMode === "signed" ? "−128…127 → преобразуется в −1…1" : signalMode === "funcbeat" ? "function(time, sampleRate, n) или stateful-выражение; формат определяется автоматически" : "готовый сигнал −1…1 без 8-битного преобразования"}</span></div><div className="editor-foot"><span>{signalMode==="funcbeat"?"AUTO PROGRAM / EXPRESSION · NATIVE RATE · STEREO":"JS EXPRESSION · t, sr, n AVAILABLE · DEBUG THROW SAFE"}</span><button onClick={()=>void startAudio("preview")}>CHECK + PREVIEW</button></div></details>
       </section>}
 
       {game !== "setup" && <section className={`game-shell ${game} ${modifiers.hidden?"hidden-mod":""}`}>

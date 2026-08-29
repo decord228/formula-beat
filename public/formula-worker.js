@@ -21,8 +21,15 @@ function compileFormula(source, signalMode) {
     if (typeof program !== "function") throw new Error("FUNCBEAT MUST RETURN FUNCTION(TIME, SAMPLERATE, N)");
     return (t, sr, n) => program(t / sr, sr, n);
   };
-  if (signalMode === "funcbeat") return compileProgram();
-  try { return new Function("M", `${prelude}return function(t,sr,n){ return (${cleaned}); };`)(Math); }
+  const compileExpression = () => new Function("M", `${prelude}return function(t,sr,n){ return (${cleaned}); };`)(Math);
+  // Composer snippets are often labelled funcbeat even when they are actually
+  // stateful sample expressions. Accept both contracts without making the user
+  // rewrite or reclassify a large formula.
+  if (signalMode === "funcbeat") {
+    try { return compileProgram(); }
+    catch { return compileExpression(); }
+  }
+  try { return compileExpression(); }
   catch { return compileProgram(); }
 }
 
@@ -41,12 +48,17 @@ function renderChunk(speed) {
   for (let i = 0; i < chunkSize; i++) {
     const formulaTick = Math.floor(tick);
     if (formulaTick !== lastFormulaTick) {
-      lastFormulaTick = formulaTick;
-      try { cachedResult = renderer(formulaTick, formulaRate, nValue); }
-      catch (error) {
-        if (typeof error !== "string" && !runtimeErrorSent) {
-          runtimeErrorSent = true;
-          self.postMessage({ type: "runtime-error", message: error instanceof Error ? error.message : "unknown error" });
+      // Stateful formulas expect to be called once for every integer t. When
+      // formulaRate is above the device rate, advance every skipped sample so
+      // filters, delays and oscillators keep their intended state.
+      while (lastFormulaTick < formulaTick) {
+        lastFormulaTick += 1;
+        try { cachedResult = renderer(lastFormulaTick, formulaRate, nValue); }
+        catch (error) {
+          if (typeof error !== "string" && !runtimeErrorSent) {
+            runtimeErrorSent = true;
+            self.postMessage({ type: "runtime-error", message: error instanceof Error ? error.message : "unknown error" });
+          }
         }
       }
     }
