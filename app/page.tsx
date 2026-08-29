@@ -9,6 +9,7 @@ type Particle = { x: number; y: number; vx: number; vy: number; life: number; si
 type RhythmEvent = { hitAt: number; lane: number; strength: number; hold: boolean; duration: number; source: "transient" | "melody" };
 type Modifiers = { auto: boolean; noFail: boolean; hidden: boolean };
 type FormulaSample = number | number[];
+type PcmBlock = { left: Float32Array; right: Float32Array };
 
 const TRACKS: Track[] = [
   {
@@ -120,7 +121,9 @@ export default function Home() {
   const [timingMs, setTimingMs] = useState<number | null>(null);
   const [pressedLanes, setPressedLanes] = useState<boolean[]>([false,false,false,false]);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const audioRef = useRef<{ ctx: AudioContext; processor: ScriptProcessorNode; filter: BiquadFilterNode; gain: GainNode; kind: "preview" | "game" } | null>(null);
+  const audioRef = useRef<{ ctx: AudioContext; processor: ScriptProcessorNode; filter: BiquadFilterNode; gain: GainNode; worker: Worker; kind: "preview" | "game" } | null>(null);
+  const pendingWorkerRef = useRef<Worker | null>(null);
+  const audioRequestRef = useRef(0);
   const previewTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const countdownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const notesRef = useRef<Note[]>([]);
@@ -139,10 +142,12 @@ export default function Home() {
   const track = TRACKS[trackIndex];
 
   const stopAudio = useCallback(() => {
+    audioRequestRef.current+=1;
     gameActiveRef.current = false;
     if (countdownTimerRef.current) { clearInterval(countdownTimerRef.current); countdownTimerRef.current = null; }
+    pendingWorkerRef.current?.terminate();pendingWorkerRef.current=null;
     const audio = audioRef.current;
-    if (audio) { audio.processor.disconnect(); audio.filter.disconnect(); audio.gain.disconnect(); void audio.ctx.close(); }
+    if (audio) { audio.worker.terminate(); audio.processor.disconnect(); audio.filter.disconnect(); audio.gain.disconnect(); void audio.ctx.close(); }
     audioRef.current = null;
     setAudioOn(false);
   }, []);
@@ -153,6 +158,7 @@ export default function Home() {
 
   const startAudio = useCallback(async (kind: "preview" | "game" = "game", override?: Partial<{ formula: string; mode: SignalMode; hz: number; n: number; volume: number }>) => {
     stopAudio();
+    const requestId=audioRequestRef.current;
     const source = override?.formula ?? formula;
     const mode = override?.mode ?? signalMode;
     const hz = override?.hz ?? formulaHz;
@@ -172,33 +178,32 @@ export default function Home() {
     delay.delayTime.value = kind === "game" ? 1.6 : 0;
     gain.gain.value = clamp(outputVolume / 100, 0, 1.5) * (kind === "preview" ? .22 : 1);
     playbackSpeedRef.current=1;
-    let tick = 0; let lastFormulaTick = -1; let cachedResult: FormulaSample = 0; let runtimeFailed = false;
-    let renderStride=1;let callbackLoad=0;
-    let previousMono = 0; let previousEnergy = 0; let previousPeak = 0; let adaptiveFlux = .025; let adaptiveEnergy = 0; let lastOnsetAt = -10; let lastMelodyAt = -10; let eventIndex = 0;
+    const renderWorker=new Worker(new URL("formula-worker.js",document.baseURI),{type:"module"});pendingWorkerRef.current=renderWorker;
+    const sampleQueue:PcmBlock[]=[];let pendingBlocks=0;let resolveReady:()=>void=()=>{};let rejectReady:(error:Error)=>void=()=>{};let resolveFirst:()=>void=()=>{};
+    const readyPromise=new Promise<void>((resolve,reject)=>{resolveReady=resolve;rejectReady=reject});
+    const firstBlockPromise=new Promise<void>(resolve=>{resolveFirst=resolve});
+    const targetBlocks=kind==="game"?12:8;
+    const requestBlocks=()=>{while(sampleQueue.length+pendingBlocks<targetBlocks){pendingBlocks+=1;renderWorker.postMessage({type:"render",speed:playbackSpeedRef.current})}};
+    renderWorker.onmessage=(event:MessageEvent<{type:string;left?:Float32Array;right?:Float32Array;message?:string}>)=>{const message=event.data;if(message.type==="ready"){resolveReady();return}if(message.type==="compile-error"){rejectReady(new Error(message.message||"formula worker error"));return}if(message.type==="runtime-error"){setStatus(`RUNTIME ERROR: ${(message.message||"UNKNOWN ERROR").toUpperCase().slice(0,48)}`);return}if(message.type==="chunk"&&message.left&&message.right){pendingBlocks=Math.max(0,pendingBlocks-1);sampleQueue.push({left:message.left,right:message.right});resolveFirst()}};
+    renderWorker.onerror=()=>rejectReady(new Error("formula worker failed"));
+    renderWorker.postMessage({type:"init",source,mode,formulaRate:hz,outputRate:ctx.sampleRate,n,chunkSize:processor.bufferSize});
+    try{await Promise.race([readyPromise,new Promise<void>((_,reject)=>setTimeout(()=>reject(new Error("formula worker timeout")),4000))]);requestBlocks();await Promise.race([firstBlockPromise,new Promise<void>((_,reject)=>setTimeout(()=>reject(new Error("audio buffer timeout")),4000))])}
+    catch{renderWorker.terminate();pendingWorkerRef.current=null;void ctx.close();if(audioRequestRef.current===requestId)setStatus("FORMULA WORKER ERROR");return false}
+    if(audioRequestRef.current!==requestId){renderWorker.terminate();pendingWorkerRef.current=null;void ctx.close();return false}
+    let previousMono = 0; let previousEnergy = 0; let previousPeak = 0; let adaptiveFlux = .025; let adaptiveEnergy = 0; let lastOnsetAt = -10; let lastMelodyAt = -10; let eventIndex = 0;let pitchFrame=0;let pitch={midi:0,confidence:0};
     let smoothedPitch = 60; let lastStablePitch = 60;
     const analysisMono = new Float32Array(processor.bufferSize);
     processor.onaudioprocess = (event) => {
-      const callbackStarted=performance.now();
       const left = event.outputBuffer.getChannelData(0);
       const right = event.outputBuffer.getChannelData(1);
       let energy = 0; let peak = 0; let flux = 0;
-      try {
-        for (let i = 0; i < left.length; i++) {
-          const formulaTick = Math.floor(tick);
-          if (formulaTick !== lastFormulaTick && (renderStride===1 || i%renderStride===0)) { lastFormulaTick = formulaTick; cachedResult = evaluateFormula(fn,formulaTick,hz,n,cachedResult); }
-          tick += hz / ctx.sampleRate * playbackSpeedRef.current;
-          const stereo=Array.isArray(cachedResult);const rawLeft=stereo?cachedResult[0]:cachedResult;const rawRight=stereo?(cachedResult[1]??rawLeft):rawLeft;
-          const l = normalizeSample(Number(rawLeft ?? 0), mode);
-          const r = normalizeSample(Number(rawRight ?? l), mode);
-          left[i] = l; right[i] = r;
+      const block=sampleQueue.shift();if(block){left.set(block.left);right.set(block.right)}else{left.fill(0);right.fill(0)}requestBlocks();
+      for (let i = 0; i < left.length; i++) {
+          const l=left[i],r=right[i];
           const mono = (l + r) / 2; analysisMono[i] = mono; flux += Math.abs(mono - previousMono); previousMono = mono;
           const amp = (Math.abs(l) + Math.abs(r)) / 2;
           energy += amp; peak = Math.max(peak, amp);
           if (i % 8 === 0) spectrumRef.current.wave[(i / 8) % 128] = (l + r) / 2;
-        }
-      } catch (error) {
-        left.fill(0); right.fill(0);
-        if (!runtimeFailed) { runtimeFailed = true; const message = error instanceof Error ? error.message : "unknown error"; setStatus(`RUNTIME ERROR: ${message.toUpperCase().slice(0,48)}`); }
       }
       const blockEnergy = energy / left.length; const blockFlux = flux / left.length;
       adaptiveFlux = adaptiveFlux * .965 + blockFlux * .035;
@@ -206,7 +211,7 @@ export default function Home() {
       const onsetScore = Math.max(0, blockEnergy - previousEnergy) * 1.65 + Math.max(0, peak - previousPeak) * .22 + Math.max(0, blockFlux - adaptiveFlux) * .85;
       const relativeEnergy = blockEnergy / Math.max(.025, adaptiveEnergy);
       const rawIntensity = clamp((relativeEnergy - .55) * .62 + onsetScore * 3.2 + peak * .14, 0, 1);
-      const pitch = kind === "game" ? detectPitch(analysisMono, ctx.sampleRate) : { midi: 0, confidence: 0 };
+      if(kind==="game"&&pitchFrame++%2===0)pitch=detectPitch(analysisMono,ctx.sampleRate);
       spectrumRef.current.energy = blockEnergy;
       spectrumRef.current.peak = peak;
       spectrumRef.current.flux = blockFlux;
@@ -249,12 +254,10 @@ export default function Home() {
           lastStablePitch = pitch.midi; lastMelodyAt = ctx.currentTime;
         }
       }
-      const callbackBudget=left.length/ctx.sampleRate*1000;callbackLoad=callbackLoad*.88+(performance.now()-callbackStarted)/callbackBudget*.12;
-      if(mode!=="funcbeat"&&hz>=ctx.sampleRate*.75){if(callbackLoad>.82)renderStride=4;else if(callbackLoad>.58)renderStride=2;else if(callbackLoad<.32)renderStride=1}
       previousEnergy = blockEnergy; previousPeak = peak;
     };
     processor.connect(delay); delay.connect(filter); filter.connect(gain); gain.connect(ctx.destination);
-    audioRef.current = { ctx, processor, filter, gain, kind };
+    pendingWorkerRef.current=null;audioRef.current = { ctx, processor, filter, gain, worker:renderWorker,kind };
     setAudioOn(true); setStatus(kind === "preview" ? "QUIET PREVIEW" : "SIGNAL LOCKED");
     return true;
   }, [difficulty, formula, formulaHz, nValue, sensitivity, signalMode, track.bpm, volume, stopAudio]);
@@ -365,7 +368,6 @@ export default function Home() {
   useEffect(() => {
     if (game !== "running") return;
     const beat = 60 / track.bpm;
-    let lastUiAt = -1;
     const loop = () => {
       const now = (performance.now() - startRef.current) / 1000;
       const gridStep = difficulty === 1 ? beat / 4 : difficulty === 2 ? beat / 4 : beat / 8;
@@ -432,7 +434,7 @@ export default function Home() {
         }
       }
       notesRef.current = notesRef.current.filter(n => now - (n.hitAt + n.duration) < .75);
-      if(now-lastUiAt>=1/45){lastUiAt=now;setNotes([...notesRef.current])}
+      setNotes([...notesRef.current]);
       rafRef.current = requestAnimationFrame(loop);
     };
     rafRef.current = requestAnimationFrame(loop); return () => cancelAnimationFrame(rafRef.current);
